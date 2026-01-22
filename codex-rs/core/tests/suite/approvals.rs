@@ -53,9 +53,19 @@ impl TargetPath {
                 (path, name.to_string())
             }
             TargetPath::OutsideWorkspace(name) => {
-                let path = env::current_dir()
-                    .expect("current dir should be available")
-                    .join(name);
+                let repo_root = env::current_dir().expect("current dir should be available");
+                let suffix = test
+                    .cwd
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("codex-outside");
+                let outside_root = repo_root
+                    .join("apply_patch")
+                    .join("approvals-outside")
+                    .join(suffix);
+                fs::create_dir_all(&outside_root).expect("create outside workspace dir");
+                let path = outside_root.join(name);
                 (path.clone(), path.display().to_string())
             }
         }

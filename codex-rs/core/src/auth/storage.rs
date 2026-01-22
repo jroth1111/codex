@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::token_data::TokenData;
+use crate::token_data::parse_id_token;
 use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
 use uuid::Uuid;
@@ -47,6 +48,25 @@ pub struct AuthDotJson {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct AuthDotJsonRaw {
+    #[serde(rename = "OPENAI_API_KEY")]
+    openai_api_key: Option<String>,
+    #[serde(default)]
+    tokens: Option<TokenDataRaw>,
+    #[serde(default)]
+    last_refresh: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct TokenDataRaw {
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 pub const AUTH_STORE_VERSION: u8 = 2;
@@ -164,8 +184,14 @@ pub(crate) fn parse_auth_store(contents: &str) -> std::io::Result<AuthStore> {
         return Ok(store);
     }
 
-    let legacy: AuthDotJson = serde_json::from_value(value).map_err(std::io::Error::other)?;
-    Ok(auth_store_from_legacy(legacy))
+    match serde_json::from_value::<AuthDotJson>(value.clone()) {
+        Ok(legacy) => Ok(auth_store_from_legacy(legacy)),
+        Err(err) => {
+            let raw: AuthDotJsonRaw = serde_json::from_value(value)
+                .map_err(|raw_err| std::io::Error::other(format!("{err}; {raw_err}")))?;
+            Ok(auth_store_from_legacy_raw(raw))
+        }
+    }
 }
 
 pub(crate) fn auth_store_from_legacy(auth: AuthDotJson) -> AuthStore {
@@ -203,6 +229,60 @@ pub(crate) fn auth_store_from_legacy(auth: AuthDotJson) -> AuthStore {
             AuthProviderEntry::Oauth(provider),
         );
     }
+
+    store
+}
+
+fn auth_store_from_legacy_raw(auth: AuthDotJsonRaw) -> AuthStore {
+    let mut store = AuthStore {
+        openai_api_key: auth.openai_api_key,
+        ..Default::default()
+    };
+
+    let Some(tokens) = auth.tokens else {
+        return store;
+    };
+
+    let id_token = match parse_id_token(&tokens.id_token) {
+        Ok(id_token) => id_token,
+        Err(err) => {
+            warn!("failed to parse stored id_token; dropping legacy tokens: {err}");
+            return store;
+        }
+    };
+
+    let record_id = Uuid::new_v4().to_string();
+    let now = auth.last_refresh.unwrap_or_else(Utc::now);
+    let record = OAuthRecord {
+        id: record_id.clone(),
+        namespace: DEFAULT_OAUTH_NAMESPACE.to_string(),
+        label: id_token.email.clone(),
+        tokens: TokenData {
+            id_token,
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            account_id: tokens.account_id,
+        },
+        last_refresh: auth.last_refresh,
+        created_at: now,
+        updated_at: now,
+        health: OAuthHealth::default(),
+    };
+    let mut provider = OAuthProvider {
+        active: HashMap::new(),
+        order: HashMap::new(),
+        records: vec![record],
+    };
+    provider
+        .active
+        .insert(DEFAULT_OAUTH_NAMESPACE.to_string(), record_id.clone());
+    provider
+        .order
+        .insert(DEFAULT_OAUTH_NAMESPACE.to_string(), vec![record_id]);
+    store.providers.insert(
+        DEFAULT_OAUTH_PROVIDER_ID.to_string(),
+        AuthProviderEntry::Oauth(provider),
+    );
 
     store
 }

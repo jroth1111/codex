@@ -8,16 +8,14 @@ use codex_core::CodexAuth;
 use codex_core::CodexThread;
 use codex_core::ModelProviderInfo;
 use codex_core::ThreadManager;
-use codex_core::WireApi;
 use codex_core::built_in_model_providers;
 use codex_core::config::Config;
 use codex_core::features::Feature;
-use codex_core::protocol::AskForApproval;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::Op;
-use codex_core::protocol::SandboxPolicy;
-use codex_core::protocol::SessionConfiguredEvent;
-use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::user_input::UserInput;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -57,6 +55,7 @@ pub struct TestCodexBuilder {
     config_mutators: Vec<Box<ConfigMutator>>,
     auth: CodexAuth,
     pre_build_hooks: Vec<Box<PreBuildHook>>,
+    home: Option<Arc<TempDir>>,
 }
 
 impl TestCodexBuilder {
@@ -88,8 +87,16 @@ impl TestCodexBuilder {
         self
     }
 
+    pub fn with_home(mut self, home: Arc<TempDir>) -> Self {
+        self.home = Some(home);
+        self
+    }
+
     pub async fn build(&mut self, server: &wiremock::MockServer) -> anyhow::Result<TestCodex> {
-        let home = Arc::new(TempDir::new()?);
+        let home = match self.home.clone() {
+            Some(home) => home,
+            None => Arc::new(TempDir::new()?),
+        };
         self.build_with_home(server, home, None).await
     }
 
@@ -98,7 +105,10 @@ impl TestCodexBuilder {
         server: &StreamingSseServer,
     ) -> anyhow::Result<TestCodex> {
         let base_url = server.uri();
-        let home = Arc::new(TempDir::new()?);
+        let home = match self.home.clone() {
+            Some(home) => home,
+            None => Arc::new(TempDir::new()?),
+        };
         self.build_with_home_and_base_url(format!("{base_url}/v1"), home, None)
             .await
     }
@@ -108,11 +118,14 @@ impl TestCodexBuilder {
         server: &WebSocketTestServer,
     ) -> anyhow::Result<TestCodex> {
         let base_url = format!("{}/v1", server.uri());
-        let home = Arc::new(TempDir::new()?);
+        let home = match self.home.clone() {
+            Some(home) => home,
+            None => Arc::new(TempDir::new()?),
+        };
         let base_url_clone = base_url.clone();
         self.config_mutators.push(Box::new(move |config| {
             config.model_provider.base_url = Some(base_url_clone);
-            config.model_provider.wire_api = WireApi::ResponsesWebsocket;
+            config.features.enable(Feature::ResponsesWebsockets);
         }));
         self.build_with_home_and_base_url(base_url, home, None)
             .await
@@ -156,7 +169,7 @@ impl TestCodexBuilder {
         resume_from: Option<PathBuf>,
     ) -> anyhow::Result<TestCodex> {
         let auth = self.auth.clone();
-        let thread_manager = ThreadManager::with_models_provider_and_home(
+        let thread_manager = codex_core::test_support::thread_manager_with_models_provider_and_home(
             auth.clone(),
             config.model_provider.clone(),
             config.codex_home.clone(),
@@ -165,7 +178,7 @@ impl TestCodexBuilder {
 
         let new_conversation = match resume_from {
             Some(path) => {
-                let auth_manager = codex_core::AuthManager::from_auth_for_testing(auth);
+                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
                 thread_manager
                     .resume_thread_from_rollout(config.clone(), path, auth_manager)
                     .await?
@@ -200,6 +213,14 @@ impl TestCodexBuilder {
             hook(home.path());
         }
         if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
+            config.codex_linux_sandbox_exe = Some(path);
+        } else if let Ok(exe) = std::env::current_exe()
+            && let Some(path) = exe
+                .parent()
+                .and_then(|parent| parent.parent())
+                .map(|parent| parent.join("codex"))
+            && path.is_file()
+        {
             config.codex_linux_sandbox_exe = Some(path);
         }
 
@@ -278,7 +299,7 @@ impl TestCodex {
                 sandbox_policy,
                 model: session_model,
                 effort: None,
-                summary: ReasoningSummary::Auto,
+                summary: None,
                 collaboration_mode: None,
                 personality: None,
             })
@@ -432,5 +453,6 @@ pub fn test_codex() -> TestCodexBuilder {
         config_mutators: vec![],
         auth: CodexAuth::from_api_key("dummy"),
         pre_build_hooks: vec![],
+        home: None,
     }
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
@@ -14,30 +15,33 @@ use codex_api::AggregateStreamExt;
 use codex_api::ChatClient as ApiChatClient;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
-use codex_api::Prompt as ApiPrompt;
+use codex_api::MemoriesClient as ApiMemoriesClient;
+use codex_api::MemorySummarizeInput as ApiMemorySummarizeInput;
+use codex_api::MemorySummarizeOutput as ApiMemorySummarizeOutput;
+use codex_api::RawMemory as ApiRawMemory;
 use codex_api::RequestTelemetry;
 use codex_api::ReqwestTransport;
 use codex_api::ResponseAppendWsRequest;
 use codex_api::ResponseCreateWsRequest;
-use codex_api::ResponseStream as ApiResponseStream;
+use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient as ApiResponsesClient;
 use codex_api::ResponsesOptions as ApiResponsesOptions;
 use codex_api::ResponsesWebsocketClient as ApiWebSocketResponsesClient;
 use codex_api::ResponsesWebsocketConnection as ApiWebSocketConnection;
 use codex_api::SseTelemetry;
 use codex_api::TransportError;
+use codex_api::WebsocketTelemetry;
 use codex_api::build_conversation_headers;
 use codex_api::common::Reasoning;
 use codex_api::common::ResponsesWsRequest;
 use codex_api::create_text_param_for_request;
 use codex_api::error::ApiError;
 use codex_api::requests::responses::Compression;
-use codex_app_server_protocol::AuthMode;
 use codex_otel::OtelManager;
 
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
-use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -49,9 +53,13 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
-use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::TryRecvError;
+use tokio_tungstenite::tungstenite::Error;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::trace;
 use tracing::warn;
 
 use crate::AuthManager;
@@ -66,43 +74,102 @@ use crate::default_client::build_reqwest_client;
 use crate::error::CodexErr;
 use crate::error::RefreshTokenFailedReason;
 use crate::error::Result;
-use crate::features::FEATURES;
-use crate::features::Feature;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::WireApi;
-use crate::tools::spec::create_tools_json_for_chat_completions_api;
 use crate::tools::spec::create_tools_json_for_responses_api;
 
-pub const WEB_SEARCH_ELIGIBLE_HEADER: &str = "x-oai-web-search-eligible";
+pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
+pub const OPENAI_BETA_RESPONSES_WEBSOCKETS: &str = "responses_websockets=2026-02-04";
 pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS: u64 = 30_000;
 const DEFAULT_AUTH_FAILURE_COOLDOWN_MS: u64 = 5 * 60_000;
 const DEFAULT_PAYMENT_REQUIRED_COOLDOWN_MS: u64 = 60 * 60_000;
 const DEFAULT_NETWORK_RETRY_ATTEMPTS: u32 = 1;
 
-#[derive(Debug)]
-struct ModelClientState {
-    config: Arc<Config>,
-    auth_manager: Option<Arc<AuthManager>>,
-    model_info: ModelInfo,
-    otel_manager: OtelManager,
-    provider: ModelProviderInfo,
-    conversation_id: ThreadId,
-    effort: Option<ReasoningEffortConfig>,
-    summary: ReasoningSummaryConfig,
-    session_source: SessionSource,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesWebsocketVersion {
+    V1,
+    V2,
 }
 
+pub fn ws_version_from_features(config: &Config) -> Option<ResponsesWebsocketVersion> {
+    match (
+        config
+            .features
+            .enabled(crate::features::Feature::ResponsesWebsockets),
+        config
+            .features
+            .enabled(crate::features::Feature::ResponsesWebsocketsV2),
+    ) {
+        (_, true) => Some(ResponsesWebsocketVersion::V2),
+        (true, false) => Some(ResponsesWebsocketVersion::V1),
+        (false, false) => None,
+    }
+}
+
+/// Session-scoped state shared by all [`ModelClient`] clones.
+///
+/// This is intentionally kept minimal so `ModelClient` does not need to hold a full `Config`. Most
+/// configuration is per turn and is passed explicitly to streaming/unary methods.
+#[derive(Debug)]
+struct ModelClientState {
+    auth_manager: Option<Arc<AuthManager>>,
+    conversation_id: ThreadId,
+    provider: ModelProviderInfo,
+    session_source: SessionSource,
+    model_verbosity: Option<VerbosityConfig>,
+    responses_websocket_version: Option<ResponsesWebsocketVersion>,
+    enable_request_compression: bool,
+    include_timing_metrics: bool,
+    beta_features_header: Option<String>,
+    disable_websockets: AtomicBool,
+    cached_websocket_session: StdMutex<WebsocketSession>,
+}
+
+/// Resolved API client setup for a single request attempt.
+///
+/// Keeping this as a single bundle ensures prewarm and normal request paths
+/// share the same auth/provider setup flow.
+struct CurrentClientSetup {
+    auth: Option<CodexAuth>,
+    api_provider: codex_api::Provider,
+    api_auth: CoreAuthProvider,
+}
+
+/// A session-scoped client for model-provider API calls.
+///
+/// This holds configuration and state that should be shared across turns within a Codex session
+/// (auth, provider selection, conversation id, feature-gated request behavior, and transport
+/// fallback state).
+///
+/// WebSocket fallback is session-scoped: once a turn activates the HTTP fallback, subsequent turns
+/// will also use HTTP for the remainder of the session.
+///
+/// Turn-scoped settings (model selection, reasoning controls, telemetry context, and turn
+/// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
+/// call site.
 #[derive(Debug, Clone)]
 pub struct ModelClient {
     state: Arc<ModelClientState>,
 }
 
+/// A turn-scoped streaming session created from a [`ModelClient`].
+///
+/// The session establishes a Responses WebSocket connection lazily and reuses it across multiple
+/// requests within the turn. It also caches per-turn state:
+///
+/// - The last full request, so subsequent calls can use `response.append` only when the current
+///   request is an incremental extension of the previous one.
+/// - The `x-codex-turn-state` sticky-routing token, which must be replayed for all requests within
+///   the same turn.
+///
+/// Create a fresh `ModelClientSession` for each Codex turn. Reusing it across turns would replay
+/// the previous turn's sticky-routing token into the next turn, which violates the client/server
+/// contract and can cause routing bugs.
 pub struct ModelClientSession {
-    state: Arc<ModelClientState>,
-    connection: Option<ApiWebSocketConnection>,
-    websocket_last_items: Vec<ResponseItem>,
+    client: ModelClient,
+    websocket_session: WebsocketSession,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -116,101 +183,101 @@ pub struct ModelClientSession {
     turn_state: Arc<OnceLock<String>>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Debug, Clone)]
+struct LastResponse {
+    response_id: String,
+    items_added: Vec<ResponseItem>,
+    can_append: bool,
+}
+
+#[derive(Debug, Default)]
+struct WebsocketSession {
+    connection: Option<ApiWebSocketConnection>,
+    last_request: Option<ResponsesApiRequest>,
+    last_response_rx: Option<oneshot::Receiver<LastResponse>>,
+}
+
+enum WebsocketStreamOutcome {
+    Stream(ResponseStream),
+    FallbackToHttp,
+}
+
 impl ModelClient {
+    #[allow(clippy::too_many_arguments)]
+    /// Creates a new session-scoped `ModelClient`.
+    ///
+    /// All arguments are expected to be stable for the lifetime of a Codex session. Per-turn values
+    /// are passed to [`ModelClientSession::stream`] (and other turn-scoped methods) explicitly.
     pub fn new(
-        config: Arc<Config>,
         auth_manager: Option<Arc<AuthManager>>,
-        model_info: ModelInfo,
-        otel_manager: OtelManager,
-        provider: ModelProviderInfo,
-        effort: Option<ReasoningEffortConfig>,
-        summary: ReasoningSummaryConfig,
         conversation_id: ThreadId,
+        provider: ModelProviderInfo,
         session_source: SessionSource,
+        model_verbosity: Option<VerbosityConfig>,
+        responses_websocket_version: Option<ResponsesWebsocketVersion>,
+        enable_request_compression: bool,
+        include_timing_metrics: bool,
+        beta_features_header: Option<String>,
     ) -> Self {
         Self {
             state: Arc::new(ModelClientState {
-                config,
                 auth_manager,
-                model_info,
-                otel_manager,
-                provider,
                 conversation_id,
-                effort,
-                summary,
+                provider,
                 session_source,
+                model_verbosity,
+                responses_websocket_version,
+                enable_request_compression,
+                include_timing_metrics,
+                beta_features_header,
+                disable_websockets: AtomicBool::new(false),
+                cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
         }
     }
 
+    /// Creates a fresh turn-scoped streaming session.
+    ///
+    /// This constructor does not perform network I/O itself; the session opens a websocket lazily
+    /// when the first stream request is issued.
     pub fn new_session(&self) -> ModelClientSession {
         ModelClientSession {
-            state: Arc::clone(&self.state),
-            connection: None,
-            websocket_last_items: Vec::new(),
+            client: self.clone(),
+            websocket_session: self.take_cached_websocket_session(),
             turn_state: Arc::new(OnceLock::new()),
         }
     }
-}
 
-impl ModelClient {
-    pub fn get_model_context_window(&self) -> Option<i64> {
-        let model_info = &self.state.model_info;
-        let effective_context_window_percent = model_info.effective_context_window_percent;
-        model_info.context_window.map(|context_window| {
-            context_window.saturating_mul(effective_context_window_percent) / 100
-        })
+    fn take_cached_websocket_session(&self) -> WebsocketSession {
+        let mut cached_websocket_session = self
+            .state
+            .cached_websocket_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *cached_websocket_session)
     }
 
-    pub fn config(&self) -> Arc<Config> {
-        Arc::clone(&self.state.config)
-    }
-
-    pub fn provider(&self) -> &ModelProviderInfo {
-        &self.state.provider
-    }
-
-    pub fn get_provider(&self) -> ModelProviderInfo {
-        self.state.provider.clone()
-    }
-
-    pub fn get_otel_manager(&self) -> OtelManager {
-        self.state.otel_manager.clone()
-    }
-
-    pub fn get_session_source(&self) -> SessionSource {
-        self.state.session_source.clone()
-    }
-
-    /// Returns the currently configured model slug.
-    pub fn get_model(&self) -> String {
-        self.state.model_info.slug.clone()
-    }
-
-    pub fn get_model_info(&self) -> ModelInfo {
-        self.state.model_info.clone()
-    }
-
-    /// Returns the current reasoning effort setting.
-    pub fn get_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
-        self.state.effort
-    }
-
-    /// Returns the current reasoning summary setting.
-    pub fn get_reasoning_summary(&self) -> ReasoningSummaryConfig {
-        self.state.summary
-    }
-
-    pub fn get_auth_manager(&self) -> Option<Arc<AuthManager>> {
-        self.state.auth_manager.clone()
+    fn store_cached_websocket_session(&self, websocket_session: WebsocketSession) {
+        *self
+            .state
+            .cached_websocket_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
     }
 
     /// Compacts the current conversation history using the Compact endpoint.
     ///
     /// This is a unary call (no streaming) that returns a new list of
     /// `ResponseItem`s representing the compacted transcript.
-    pub async fn compact_conversation_history(&self, prompt: &Prompt) -> Result<Vec<ResponseItem>> {
+    ///
+    /// The model selection and telemetry context are passed explicitly to keep `ModelClient`
+    /// session-scoped.
+    pub async fn compact_conversation_history(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        otel_manager: &OtelManager,
+    ) -> Result<Vec<ResponseItem>> {
         if prompt.input.is_empty() {
             return Ok(Vec::new());
         }
@@ -272,12 +339,13 @@ impl ModelClient {
             .to_api_provider(auth.as_ref().map(|a| a.mode))?;
         let api_auth = auth_provider_from_auth(auth.clone(), &self.state.provider)?;
         let transport = ReqwestTransport::new(build_reqwest_client());
-        let request_telemetry = self.build_request_telemetry();
-        let client = ApiCompactClient::new(transport, api_provider, api_auth)
-            .with_telemetry(Some(request_telemetry));
+        let request_telemetry = Self::build_request_telemetry(otel_manager);
+        let client =
+            ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
+                .with_telemetry(Some(request_telemetry));
 
         let payload = ApiCompactionInput {
-            model: &self.state.model_info.slug,
+            model: &model_info.slug,
             input: &prompt.input,
             instructions: &instructions,
         };
@@ -285,46 +353,66 @@ impl ModelClient {
         client
             .compact_input(&payload, extra_headers)
             .await
-            .map_err(map_api_error)
+    }
+
+    /// Builds websocket handshake headers for both prewarm and turn-time reconnect.
+    ///
+    /// Callers should pass the current turn-state lock when available so sticky-routing state is
+    /// replayed on reconnect within the same turn.
+    fn build_websocket_headers(
+        &self,
+        ws_version: ResponsesWebsocketVersion,
+        turn_state: Option<&Arc<OnceLock<String>>>,
+        turn_metadata_header: Option<&str>,
+    ) -> ApiHeaderMap {
+        let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
+        let mut headers = build_responses_headers(
+            self.state.beta_features_header.as_deref(),
+            turn_state,
+            turn_metadata_header.as_ref(),
+        );
+        headers.extend(build_conversation_headers(Some(
+            self.state.conversation_id.to_string(),
+        )));
+        let responses_websockets_beta_header = match ws_version {
+            ResponsesWebsocketVersion::V2 => RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE,
+            ResponsesWebsocketVersion::V1 => OPENAI_BETA_RESPONSES_WEBSOCKETS,
+        };
+        headers.insert(
+            OPENAI_BETA_HEADER,
+            HeaderValue::from_static(responses_websockets_beta_header),
+        );
+        if self.state.include_timing_metrics {
+            headers.insert(
+                X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER,
+                HeaderValue::from_static("true"),
+            );
+        }
+        headers
+    }
+}
+
+impl Drop for ModelClientSession {
+    fn drop(&mut self) {
+        let websocket_session = std::mem::take(&mut self.websocket_session);
+        self.client
+            .store_cached_websocket_session(websocket_session);
     }
 }
 
 impl ModelClientSession {
-    /// Streams a single model turn using either the Responses or Chat
-    /// Completions wire API, depending on the configured provider.
-    ///
-    /// For Chat providers, the underlying stream is optionally aggregated
-    /// based on the `show_raw_agent_reasoning` flag in the config.
-    pub async fn stream(&mut self, prompt: &Prompt) -> Result<ResponseStream> {
-        match self.state.provider.wire_api {
-            WireApi::Responses => self.stream_responses_api(prompt).await,
-            WireApi::ResponsesWebsocket => self.stream_responses_websocket(prompt).await,
-            WireApi::Chat => {
-                let api_stream = self.stream_chat_completions(prompt).await?;
-
-                if self.state.config.show_raw_agent_reasoning {
-                    Ok(map_response_stream(
-                        api_stream.streaming_mode(),
-                        self.state.otel_manager.clone(),
-                    ))
-                } else {
-                    Ok(map_response_stream(
-                        api_stream.aggregate(),
-                        self.state.otel_manager.clone(),
-                    ))
-                }
-            }
-        }
+    fn activate_http_fallback(&self, websocket_enabled: bool) -> bool {
+        websocket_enabled
+            && !self
+                .client
+                .state
+                .disable_websockets
+                .swap(true, Ordering::Relaxed)
     }
 
-    fn build_responses_request(&self, prompt: &Prompt) -> Result<ApiPrompt> {
-        let instructions = prompt.base_instructions.text.clone();
-        let tools_json: Vec<Value> = create_tools_json_for_responses_api(&prompt.tools)?;
-        Ok(build_api_prompt(prompt, instructions, tools_json))
-    }
-
-    fn build_responses_options(
+    fn build_responses_request(
         &self,
+        provider: &codex_api::Provider,
         prompt: &Prompt,
         compression: Compression,
     ) -> ApiResponsesOptions {
@@ -344,30 +432,125 @@ impl ModelClientSession {
         )
     }
 
+    fn prepare_websocket_request(
+        &mut self,
+        payload: ResponseCreateWsRequest,
+        request: &ResponsesApiRequest,
+        ws_version: ResponsesWebsocketVersion,
+    ) -> ResponsesWsRequest {
+        let Some(last_response) = self.get_last_response() else {
+            return ResponsesWsRequest::ResponseCreate(payload);
+        };
+        let allow_empty_delta = matches!(ws_version, ResponsesWebsocketVersion::V2);
+        let Some(append_items) =
+            self.get_incremental_items(request, Some(&last_response), allow_empty_delta)
+        else {
+            return ResponsesWsRequest::ResponseCreate(payload);
+        };
+
+        match ws_version {
+            ResponsesWebsocketVersion::V2 => {
+                if last_response.response_id.is_empty() {
+                    trace!("incremental request failed, no previous response id");
+                    return ResponsesWsRequest::ResponseCreate(payload);
+                }
+
+                ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
+                    previous_response_id: Some(last_response.response_id),
+                    input: append_items,
+                    ..payload
+                })
+            }
+            ResponsesWebsocketVersion::V1 => {
+                if !last_response.can_append {
+                    trace!("incremental request failed, can't append");
+                    return ResponsesWsRequest::ResponseCreate(payload);
+                }
+                ResponsesWsRequest::ResponseAppend(ResponseAppendWsRequest {
+                    input: append_items,
+                    client_metadata: payload.client_metadata,
+                })
+            }
+        }
+    }
+
+    /// Opportunistically preconnects a websocket for this turn-scoped client session.
+    ///
+    /// This performs only connection setup; it never sends prompt payloads.
+    pub async fn preconnect_websocket(
+        &mut self,
+        otel_manager: &OtelManager,
+        model_info: &ModelInfo,
+    ) -> std::result::Result<(), ApiError> {
+        let Some(ws_version) = self.client.active_ws_version(model_info) else {
+            return Ok(());
+        };
+        if self.websocket_session.connection.is_some() {
+            return Ok(());
+        }
+
+        let client_setup = self.client.current_client_setup().await.map_err(|err| {
+            ApiError::Stream(format!(
+                "failed to build websocket prewarm client setup: {err}"
+            ))
+        })?;
+
+        let connection = self
+            .client
+            .connect_websocket(
+                otel_manager,
+                client_setup.api_provider,
+                client_setup.api_auth,
+                ws_version,
+                Some(Arc::clone(&self.turn_state)),
+                None,
+            )
+            .await?;
+        self.websocket_session.connection = Some(connection);
+        Ok(())
+    }
+    /// Returns a websocket connection for this turn.
     async fn websocket_connection(
         &mut self,
+        otel_manager: &OtelManager,
         api_provider: codex_api::Provider,
         api_auth: CoreAuthProvider,
+        ws_version: ResponsesWebsocketVersion,
+        turn_metadata_header: Option<&str>,
         options: &ApiResponsesOptions,
     ) -> std::result::Result<&ApiWebSocketConnection, ApiError> {
-        let needs_new = match self.connection.as_ref() {
+        let needs_new = match self.websocket_session.connection.as_ref() {
             Some(conn) => conn.is_closed().await,
             None => true,
         };
 
         if needs_new {
-            let mut headers = options.extra_headers.clone();
-            headers.extend(build_conversation_headers(options.conversation_id.clone()));
-            let new_conn: ApiWebSocketConnection =
-                ApiWebSocketResponsesClient::new(api_provider, api_auth)
-                    .connect(headers, options.turn_state.clone())
-                    .await?;
-            self.connection = Some(new_conn);
+            self.websocket_session.last_request = None;
+            self.websocket_session.last_response_rx = None;
+            let turn_state = options
+                .turn_state
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&self.turn_state));
+            let new_conn = self
+                .client
+                .connect_websocket(
+                    otel_manager,
+                    api_provider,
+                    api_auth,
+                    ws_version,
+                    Some(turn_state),
+                    turn_metadata_header,
+                )
+                .await?;
+            self.websocket_session.connection = Some(new_conn);
         }
 
-        self.connection.as_ref().ok_or(ApiError::Stream(
-            "websocket connection is unavailable".to_string(),
-        ))
+        self.websocket_session
+            .connection
+            .as_ref()
+            .ok_or(ApiError::Stream(
+                "websocket connection is unavailable".to_string(),
+            ))
     }
 
     fn responses_request_compression(&self, auth: Option<&crate::auth::CodexAuth>) -> Compression {
@@ -472,13 +655,25 @@ impl ModelClientSession {
     ///
     /// Handles SSE fixtures, reasoning summaries, verbosity, and the
     /// `text` controls used for output schemas.
-    async fn stream_responses_api(&self, prompt: &Prompt) -> Result<ResponseStream> {
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_responses_api(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        otel_manager: &OtelManager,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        turn_metadata_header: Option<&str>,
+    ) -> Result<ResponseStream> {
         if let Some(path) = &*CODEX_RS_SSE_FIXTURE {
             warn!(path, "Streaming from fixture");
-            let stream =
-                codex_api::stream_from_fixture(path, self.state.provider.stream_idle_timeout())
-                    .map_err(map_api_error)?;
-            return Ok(map_response_stream(stream, self.state.otel_manager.clone()));
+            let stream = codex_api::stream_from_fixture(
+                path,
+                self.client.state.provider.stream_idle_timeout(),
+            )
+            .map_err(map_api_error)?;
+            let (stream, _last_request_rx) = map_response_stream(stream, otel_manager.clone());
+            return Ok(stream);
         }
 
         let auth_manager = self.state.auth_manager.clone();
@@ -526,36 +721,36 @@ impl ModelClientSession {
             .as_ref()
             .map(super::auth::AuthManager::unauthorized_recovery);
         loop {
-            let auth = match auth_manager.as_ref() {
-                Some(manager) => manager.auth().await,
-                None => None,
-            };
-            let api_provider = self
-                .state
-                .provider
-                .to_api_provider(auth.as_ref().map(|a| a.mode))?;
-            let api_auth = auth_provider_from_auth(auth.clone(), &self.state.provider)?;
+            let client_setup = self.client.current_client_setup().await?;
             let transport = ReqwestTransport::new(build_reqwest_client());
-            let (request_telemetry, sse_telemetry) = self.build_streaming_telemetry();
-            let compression = self.responses_request_compression(auth.as_ref());
+            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(otel_manager);
+            let compression = self.responses_request_compression(client_setup.auth.as_ref());
+            let options = self.build_responses_options(turn_metadata_header, compression);
 
-            let client = ApiResponsesClient::new(transport, api_provider, api_auth)
-                .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
-
-            let options = self.build_responses_options(prompt, compression);
-
-            let stream_result = client
-                .stream_prompt(&self.state.model_info.slug, &api_prompt, options)
-                .await;
+            let request = self.build_responses_request(
+                &client_setup.api_provider,
+                prompt,
+                model_info,
+                effort,
+                summary,
+            )?;
+            let client = ApiResponsesClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+            )
+            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            let stream_result = client.stream_request(request, options).await;
 
             match stream_result {
                 Ok(stream) => {
-                    return Ok(map_response_stream(stream, self.state.otel_manager.clone()));
+                    let (stream, _) = map_response_stream(stream, otel_manager.clone());
+                    return Ok(stream);
                 }
-                Err(ApiError::Transport(TransportError::Http { status, .. }))
-                    if status == StatusCode::UNAUTHORIZED =>
-                {
-                    handle_unauthorized(status, &mut auth_recovery).await?;
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    handle_unauthorized(unauthorized_transport, &mut auth_recovery).await?;
                     continue;
                 }
                 Err(err) => return Err(map_api_error(err)),
@@ -564,9 +759,19 @@ impl ModelClientSession {
     }
 
     /// Streams a turn via the Responses API over WebSocket transport.
-    async fn stream_responses_websocket(&mut self, prompt: &Prompt) -> Result<ResponseStream> {
-        let auth_manager = self.state.auth_manager.clone();
-        let api_prompt = self.build_responses_request(prompt)?;
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_responses_websocket(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        ws_version: ResponsesWebsocketVersion,
+        otel_manager: &OtelManager,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        turn_metadata_header: Option<&str>,
+        warmup: bool,
+    ) -> Result<WebsocketStreamOutcome> {
+        let auth_manager = self.client.state.auth_manager.clone();
 
         if let Some(manager) = auth_manager.clone()
             && let Some(rotation) = OAuthRotationPlan::try_new(
@@ -650,64 +855,88 @@ impl ModelClientSession {
             .as_ref()
             .map(super::auth::AuthManager::unauthorized_recovery);
         loop {
-            let auth = match auth_manager.as_ref() {
-                Some(manager) => manager.auth().await,
-                None => None,
+            let client_setup = self.client.current_client_setup().await?;
+            let compression = self.responses_request_compression(client_setup.auth.as_ref());
+
+            let options = self.build_responses_options(turn_metadata_header, compression);
+            let request = self.build_responses_request(
+                &client_setup.api_provider,
+                prompt,
+                model_info,
+                effort,
+                summary,
+            )?;
+            let mut ws_payload = ResponseCreateWsRequest {
+                client_metadata: build_ws_client_metadata(turn_metadata_header),
+                ..ResponseCreateWsRequest::from(&request)
             };
-            let api_provider = self
-                .state
-                .provider
-                .to_api_provider(auth.as_ref().map(|a| a.mode))?;
-            let api_auth = auth_provider_from_auth(auth.clone(), &self.state.provider)?;
-            let compression = self.responses_request_compression(auth.as_ref());
+            if warmup {
+                ws_payload.generate = Some(false);
+            }
 
-            let options = self.build_responses_options(prompt, compression);
-            let request = self.prepare_websocket_request(&api_prompt, &options);
-
-            let connection = match self
-                .websocket_connection(api_provider.clone(), api_auth.clone(), &options)
+            match self
+                .websocket_connection(
+                    otel_manager,
+                    client_setup.api_provider,
+                    client_setup.api_auth,
+                    ws_version,
+                    turn_metadata_header,
+                    &options,
+                )
                 .await
             {
-                Ok(connection) => connection,
+                Ok(_) => {}
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
-                    if status == StatusCode::UNAUTHORIZED =>
+                    if status == StatusCode::UPGRADE_REQUIRED =>
                 {
-                    handle_unauthorized(status, &mut auth_recovery).await?;
+                    return Ok(WebsocketStreamOutcome::FallbackToHttp);
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    handle_unauthorized(unauthorized_transport, &mut auth_recovery).await?;
                     continue;
                 }
                 Err(err) => return Err(map_api_error(err)),
-            };
+            }
 
-            let stream_result = connection
-                .stream_request(request)
+            let ws_request = self.prepare_websocket_request(ws_payload, &request, ws_version);
+            self.websocket_session.last_request = Some(request);
+            let stream_result = self
+                .websocket_session
+                .connection
+                .as_ref()
+                .ok_or_else(|| {
+                    map_api_error(ApiError::Stream(
+                        "websocket connection is unavailable".to_string(),
+                    ))
+                })?
+                .stream_request(ws_request)
                 .await
                 .map_err(map_api_error)?;
-            self.websocket_last_items = api_prompt.input.clone();
-
-            return Ok(map_response_stream(
-                stream_result,
-                self.state.otel_manager.clone(),
-            ));
+            let (stream, last_request_rx) =
+                map_response_stream(stream_result, otel_manager.clone());
+            self.websocket_session.last_response_rx = Some(last_request_rx);
+            return Ok(WebsocketStreamOutcome::Stream(stream));
         }
     }
 
-    /// Builds request and SSE telemetry for streaming API calls (Chat/Responses).
-    fn build_streaming_telemetry(&self) -> (Arc<dyn RequestTelemetry>, Arc<dyn SseTelemetry>) {
-        let telemetry = Arc::new(ApiTelemetry::new(self.state.otel_manager.clone()));
+    /// Builds request and SSE telemetry for streaming API calls.
+    fn build_streaming_telemetry(
+        otel_manager: &OtelManager,
+    ) -> (Arc<dyn RequestTelemetry>, Arc<dyn SseTelemetry>) {
+        let telemetry = Arc::new(ApiTelemetry::new(otel_manager.clone()));
         let request_telemetry: Arc<dyn RequestTelemetry> = telemetry.clone();
         let sse_telemetry: Arc<dyn SseTelemetry> = telemetry;
         (request_telemetry, sse_telemetry)
     }
-}
 
-impl ModelClient {
-    /// Builds request telemetry for unary API calls (e.g., Compact endpoint).
-    fn build_request_telemetry(&self) -> Arc<dyn RequestTelemetry> {
-        let telemetry = Arc::new(ApiTelemetry::new(self.state.otel_manager.clone()));
-        let request_telemetry: Arc<dyn RequestTelemetry> = telemetry;
-        request_telemetry
+    /// Builds telemetry for the Responses API WebSocket transport.
+    fn build_websocket_telemetry(otel_manager: &OtelManager) -> Arc<dyn WebsocketTelemetry> {
+        let telemetry = Arc::new(ApiTelemetry::new(otel_manager.clone()));
+        let websocket_telemetry: Arc<dyn WebsocketTelemetry> = telemetry;
+        websocket_telemetry
     }
-}
 
 #[derive(Clone, Debug)]
 struct OAuthRotationConfigResolved {
@@ -1482,52 +1711,178 @@ fn build_api_prompt(prompt: &Prompt, instructions: String, tools_json: Vec<Value
     }
 }
 
-fn beta_feature_headers(config: &Config) -> ApiHeaderMap {
-    let enabled = FEATURES
-        .iter()
-        .filter_map(|spec| {
-            if spec.stage.beta_menu_description().is_some() && config.features.enabled(spec.id) {
-                Some(spec.key)
-            } else {
-                None
+        if matches!(ws_version, ResponsesWebsocketVersion::V1) {
+            self.preconnect_websocket(otel_manager, model_info)
+                .await
+                .map_err(map_api_error)?;
+            return Ok(());
+        }
+
+        match self
+            .stream_responses_websocket(
+                prompt,
+                model_info,
+                ws_version,
+                otel_manager,
+                effort,
+                summary,
+                turn_metadata_header,
+                true,
+            )
+            .await
+        {
+            Ok(WebsocketStreamOutcome::Stream(mut stream)) => {
+                // Wait for the v2 warmup request to complete before sending the first turn request.
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(ResponseEvent::Completed { .. }) => break,
+                        Err(err) => return Err(err),
+                        _ => {}
+                    }
+                }
+                Ok(())
             }
-        })
-        .collect::<Vec<_>>();
-    let value = enabled.join(",");
+            Ok(WebsocketStreamOutcome::FallbackToHttp) => {
+                self.try_switch_fallback_transport(otel_manager, model_info);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Streams a single model request within the current turn.
+    ///
+    /// The caller is responsible for passing per-turn settings explicitly (model selection,
+    /// reasoning settings, telemetry context, and turn metadata). This method will prefer the
+    /// Responses WebSocket transport when enabled and healthy, and will fall back to the HTTP
+    /// Responses API transport otherwise.
+    pub async fn stream(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        otel_manager: &OtelManager,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        turn_metadata_header: Option<&str>,
+    ) -> Result<ResponseStream> {
+        let wire_api = self.client.state.provider.wire_api;
+        match wire_api {
+            WireApi::Responses => {
+                if let Some(ws_version) = self.client.active_ws_version(model_info) {
+                    match self
+                        .stream_responses_websocket(
+                            prompt,
+                            model_info,
+                            ws_version,
+                            otel_manager,
+                            effort,
+                            summary,
+                            turn_metadata_header,
+                            false,
+                        )
+                        .await?
+                    {
+                        WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
+                        WebsocketStreamOutcome::FallbackToHttp => {
+                            self.try_switch_fallback_transport(otel_manager, model_info);
+                        }
+                    }
+                }
+
+                self.stream_responses_api(
+                    prompt,
+                    model_info,
+                    otel_manager,
+                    effort,
+                    summary,
+                    turn_metadata_header,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
+    ///
+    /// This is used after exhausting the provider retry budget, to force subsequent requests onto
+    /// the HTTP transport.
+    ///
+    /// Returns `true` if this call activated fallback, or `false` if fallback was already active.
+    pub(crate) fn try_switch_fallback_transport(
+        &mut self,
+        otel_manager: &OtelManager,
+        model_info: &ModelInfo,
+    ) -> bool {
+        let websocket_enabled = self.client.active_ws_version(model_info).is_some();
+        let activated = self.activate_http_fallback(websocket_enabled);
+        if activated {
+            warn!("falling back to HTTP");
+            otel_manager.counter(
+                "codex.transport.fallback_to_http",
+                1,
+                &[("from_wire_api", "responses_websocket")],
+            );
+
+            self.websocket_session.connection = None;
+            self.websocket_session.last_request = None;
+            self.websocket_session.last_response_rx = None;
+        }
+        activated
+    }
+}
+
+/// Parses per-turn metadata into an HTTP header value.
+///
+/// Invalid values are treated as absent so callers can compare and propagate
+/// metadata with the same sanitization path used when constructing headers.
+fn parse_turn_metadata_header(turn_metadata_header: Option<&str>) -> Option<HeaderValue> {
+    turn_metadata_header.and_then(|value| HeaderValue::from_str(value).ok())
+}
+
+fn build_ws_client_metadata(turn_metadata_header: Option<&str>) -> Option<HashMap<String, String>> {
+    let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header)?;
+    let turn_metadata = turn_metadata_header.to_str().ok()?.to_string();
+    let mut client_metadata = HashMap::new();
+    client_metadata.insert(X_CODEX_TURN_METADATA_HEADER.to_string(), turn_metadata);
+    Some(client_metadata)
+}
+
+/// Builds the extra headers attached to Responses API requests.
+///
+/// These headers implement Codex-specific conventions:
+///
+/// - `x-codex-beta-features`: comma-separated beta feature keys enabled for the session.
+/// - `x-codex-turn-state`: sticky routing token captured earlier in the turn.
+/// - `x-codex-turn-metadata`: optional per-turn metadata for observability.
+fn build_responses_headers(
+    beta_features_header: Option<&str>,
+    turn_state: Option<&Arc<OnceLock<String>>>,
+    turn_metadata_header: Option<&HeaderValue>,
+) -> ApiHeaderMap {
     let mut headers = ApiHeaderMap::new();
-    if !value.is_empty()
-        && let Ok(header_value) = HeaderValue::from_str(value.as_str())
+    if let Some(value) = beta_features_header
+        && !value.is_empty()
+        && let Ok(header_value) = HeaderValue::from_str(value)
     {
         headers.insert("x-codex-beta-features", header_value);
     }
-    headers
-}
-
-fn build_responses_headers(
-    config: &Config,
-    turn_state: Option<&Arc<OnceLock<String>>>,
-) -> ApiHeaderMap {
-    let mut headers = beta_feature_headers(config);
-    headers.insert(
-        WEB_SEARCH_ELIGIBLE_HEADER,
-        HeaderValue::from_static(
-            if matches!(config.web_search_mode, Some(WebSearchMode::Disabled)) {
-                "false"
-            } else {
-                "true"
-            },
-        ),
-    );
     if let Some(turn_state) = turn_state
         && let Some(state) = turn_state.get()
         && let Ok(header_value) = HeaderValue::from_str(state)
     {
         headers.insert(X_CODEX_TURN_STATE_HEADER, header_value);
     }
+    if let Some(header_value) = turn_metadata_header {
+        headers.insert(X_CODEX_TURN_METADATA_HEADER, header_value.clone());
+    }
     headers
 }
 
-fn map_response_stream<S>(api_stream: S, otel_manager: OtelManager) -> ResponseStream
+fn map_response_stream<S>(
+    api_stream: S,
+    otel_manager: OtelManager,
+) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
         + Unpin
@@ -1535,15 +1890,29 @@ where
         + 'static,
 {
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
+    let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
 
     tokio::spawn(async move {
         let mut logged_error = false;
+        let mut tx_last_response = Some(tx_last_response);
+        let mut items_added: Vec<ResponseItem> = Vec::new();
         let mut api_stream = api_stream;
         while let Some(event) = api_stream.next().await {
             match event {
+                Ok(ResponseEvent::OutputItemDone(item)) => {
+                    items_added.push(item.clone());
+                    if tx_event
+                        .send(Ok(ResponseEvent::OutputItemDone(item)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 Ok(ResponseEvent::Completed {
                     response_id,
                     token_usage,
+                    can_append,
                 }) => {
                     if let Some(usage) = &token_usage {
                         otel_manager.sse_event_completed(
@@ -1554,10 +1923,18 @@ where
                             usage.total_tokens,
                         );
                     }
+                    if let Some(sender) = tx_last_response.take() {
+                        let _ = sender.send(LastResponse {
+                            response_id: response_id.clone(),
+                            items_added: std::mem::take(&mut items_added),
+                            can_append,
+                        });
+                    }
                     if tx_event
                         .send(Ok(ResponseEvent::Completed {
                             response_id,
                             token_usage,
+                            can_append,
                         }))
                         .await
                         .is_err()
@@ -1584,7 +1961,7 @@ where
         }
     });
 
-    ResponseStream { rx_event }
+    (ResponseStream { rx_event }, rx_last_response)
 }
 
 /// Handles a 401 response by optionally refreshing ChatGPT tokens once.
@@ -1592,7 +1969,7 @@ where
 /// When refresh succeeds, the caller should retry the API call; otherwise
 /// the mapped `CodexErr` is returned to the caller.
 async fn handle_unauthorized(
-    status: StatusCode,
+    transport: TransportError,
     auth_recovery: &mut Option<UnauthorizedRecovery>,
 ) -> Result<()> {
     if let Some(recovery) = auth_recovery
@@ -1605,16 +1982,7 @@ async fn handle_unauthorized(
         };
     }
 
-    Err(map_unauthorized_status(status))
-}
-
-fn map_unauthorized_status(status: StatusCode) -> CodexErr {
-    map_api_error(ApiError::Transport(TransportError::Http {
-        status,
-        url: None,
-        headers: None,
-        body: None,
-    }))
+    Err(map_api_error(ApiError::Transport(transport)))
 }
 
 struct ApiTelemetry {
@@ -1655,5 +2023,120 @@ impl SseTelemetry for ApiTelemetry {
         duration: Duration,
     ) {
         self.otel_manager.log_sse_event(result, duration);
+    }
+}
+
+impl WebsocketTelemetry for ApiTelemetry {
+    fn on_ws_request(&self, duration: Duration, error: Option<&ApiError>) {
+        let error_message = error.map(std::string::ToString::to_string);
+        self.otel_manager
+            .record_websocket_request(duration, error_message.as_deref());
+    }
+
+    fn on_ws_event(
+        &self,
+        result: &std::result::Result<Option<std::result::Result<Message, Error>>, ApiError>,
+        duration: Duration,
+    ) {
+        self.otel_manager.record_websocket_event(result, duration);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelClient;
+    use codex_otel::OtelManager;
+    use codex_protocol::ThreadId;
+    use codex_protocol::openai_models::ModelInfo;
+    use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::SubAgentSource;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    fn test_model_client(session_source: SessionSource) -> ModelClient {
+        let provider = crate::model_provider_info::create_oss_provider_with_base_url(
+            "https://example.com/v1",
+            crate::model_provider_info::WireApi::Responses,
+        );
+        ModelClient::new(
+            None,
+            ThreadId::new(),
+            provider,
+            session_source,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+    }
+
+    fn test_model_info() -> ModelInfo {
+        serde_json::from_value(json!({
+            "slug": "gpt-test",
+            "display_name": "gpt-test",
+            "description": "desc",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                {"effort": "medium", "description": "medium"}
+            ],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1,
+            "upgrade": null,
+            "base_instructions": "base instructions",
+            "model_messages": null,
+            "supports_reasoning_summaries": false,
+            "support_verbosity": false,
+            "default_verbosity": null,
+            "apply_patch_tool_type": null,
+            "truncation_policy": {"mode": "bytes", "limit": 10000},
+            "supports_parallel_tool_calls": false,
+            "context_window": 272000,
+            "auto_compact_token_limit": null,
+            "experimental_supported_tools": []
+        }))
+        .expect("deserialize test model info")
+    }
+
+    fn test_otel_manager() -> OtelManager {
+        OtelManager::new(
+            ThreadId::new(),
+            "gpt-test",
+            "gpt-test",
+            None,
+            None,
+            None,
+            "test-originator".to_string(),
+            false,
+            "test-terminal".to_string(),
+            SessionSource::Cli,
+        )
+    }
+
+    #[test]
+    fn build_subagent_headers_sets_other_subagent_label() {
+        let client = test_model_client(SessionSource::SubAgent(SubAgentSource::Other(
+            "memory_consolidation".to_string(),
+        )));
+        let headers = client.build_subagent_headers();
+        let value = headers
+            .get("x-openai-subagent")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(value, Some("memory_consolidation"));
+    }
+
+    #[tokio::test]
+    async fn summarize_memories_returns_empty_for_empty_input() {
+        let client = test_model_client(SessionSource::Cli);
+        let model_info = test_model_info();
+        let otel_manager = test_otel_manager();
+
+        let output = client
+            .summarize_memories(Vec::new(), &model_info, None, &otel_manager)
+            .await
+            .expect("empty summarize request should succeed");
+        assert_eq!(output.len(), 0);
     }
 }

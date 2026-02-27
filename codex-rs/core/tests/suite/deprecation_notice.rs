@@ -7,8 +7,8 @@ use codex_core::config_loader::ConfigLayerStack;
 use codex_core::config_loader::ConfigRequirements;
 use codex_core::config_loader::ConfigRequirementsToml;
 use codex_core::features::Feature;
-use codex_core::protocol::DeprecationNoticeEvent;
-use codex_core::protocol::EventMsg;
+use codex_protocol::protocol::DeprecationNoticeEvent;
+use codex_protocol::protocol::EventMsg;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_absolute_path;
@@ -16,6 +16,7 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 use toml::Value as TomlValue;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -49,7 +50,7 @@ async fn emits_deprecation_notice_for_legacy_feature_flag() -> anyhow::Result<()
     assert_eq!(
         details.as_deref(),
         Some(
-            "Enable it with `--enable unified_exec` or `[features].unified_exec` in config.toml. See https://github.com/openai/codex/blob/main/docs/config.md#feature-flags for details."
+            "Enable it with `--enable unified_exec` or `[features].unified_exec` in config.toml. See https://developers.openai.com/codex/config-basic#feature-flags for details."
         ),
     );
 
@@ -107,6 +108,48 @@ async fn emits_deprecation_notice_for_experimental_instructions_file() -> anyhow
             "Move the setting to `model_instructions_file` in config.toml (or under a profile) to load instructions from a file."
         ),
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn emits_deprecation_notice_for_web_search_feature_flag_values() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    for enabled in [true, false] {
+        let server = start_mock_server().await;
+
+        let mut builder = test_codex().with_config(move |config| {
+            let mut entries = BTreeMap::new();
+            entries.insert("web_search_request".to_string(), enabled);
+            config.features.apply_map(&entries);
+        });
+
+        let TestCodex { codex, .. } = builder.build(&server).await?;
+
+        let notice = wait_for_event_match(&codex, |event| match event {
+            EventMsg::DeprecationNotice(ev)
+                if ev.summary.contains("[features].web_search_request") =>
+            {
+                Some(ev.clone())
+            }
+            _ => None,
+        })
+        .await;
+
+        let DeprecationNoticeEvent { summary, details } = notice;
+        assert_eq!(
+            summary,
+            "`[features].web_search_request` is deprecated because web search is enabled by default."
+                .to_string(),
+        );
+        assert_eq!(
+            details.as_deref(),
+            Some(
+                "Set `web_search` to `\"live\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it."
+            ),
+        );
+    }
 
     Ok(())
 }

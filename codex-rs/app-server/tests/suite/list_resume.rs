@@ -12,9 +12,9 @@ use codex_app_server_protocol::ResumeConversationParams;
 use codex_app_server_protocol::ResumeConversationResponse;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionConfiguredNotification;
-use codex_core::protocol::EventMsg;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::EventMsg;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -308,6 +308,7 @@ async fn test_list_and_resume_conversations() -> Result<()> {
             text: fork_history_text.to_string(),
         }],
         end_turn: None,
+        phase: None,
     }];
     let resume_with_history_req_id = mcp
         .send_resume_conversation_request(ResumeConversationParams {

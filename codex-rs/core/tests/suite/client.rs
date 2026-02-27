@@ -1,41 +1,49 @@
-use codex_core::AuthManager;
 use codex_core::CodexAuth;
-use codex_core::ContentItem;
-use codex_core::LocalShellAction;
-use codex_core::LocalShellExecAction;
-use codex_core::LocalShellStatus;
 use codex_core::ModelClient;
 use codex_core::ModelProviderInfo;
 use codex_core::NewThread;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
-use codex_core::ResponseItem;
+use codex_core::ResponsesWebsocketVersion;
 use codex_core::ThreadManager;
 use codex_core::WireApi;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::built_in_model_providers;
 use codex_core::default_client::originator;
 use codex_core::error::CodexErr;
-use codex_core::models_manager::manager::ModelsManager;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::Op;
-use codex_core::protocol::SessionSource;
+use codex_core::features::Feature;
+use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_otel::OtelManager;
+use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::Verbosity;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::LocalShellAction;
+use codex_protocol::models::LocalShellExecAction;
+use codex_protocol::models::LocalShellStatus;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
+use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::load_default_config_for_test;
-use core_test_support::load_sse_fixture_with_id;
+use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
+use core_test_support::responses::ev_message_item_added;
+use core_test_support::responses::ev_output_text_delta;
+use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
@@ -62,50 +70,19 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
 
-/// Build minimal SSE stream with completed marker using the JSON fixture.
-fn sse_completed(id: &str) -> String {
-    load_sse_fixture_with_id("../fixtures/completed_template.json", id)
-}
-
 #[expect(clippy::unwrap_used)]
 fn assert_message_role(request_body: &serde_json::Value, role: &str) {
     assert_eq!(request_body["role"].as_str().unwrap(), role);
 }
 
-#[expect(clippy::expect_used)]
-fn assert_message_equals(request_body: &serde_json::Value, text: &str) {
-    let content = request_body["content"][0]["text"]
-        .as_str()
-        .expect("invalid message content");
-
-    assert_eq!(
-        content, text,
-        "expected message content '{content}' to equal '{text}'"
-    );
-}
-
-#[expect(clippy::expect_used)]
-fn assert_message_starts_with(request_body: &serde_json::Value, text: &str) {
-    let content = request_body["content"][0]["text"]
-        .as_str()
-        .expect("invalid message content");
-
-    assert!(
-        content.starts_with(text),
-        "expected message content '{content}' to start with '{text}'"
-    );
-}
-
-#[expect(clippy::expect_used)]
-fn assert_message_ends_with(request_body: &serde_json::Value, text: &str) {
-    let content = request_body["content"][0]["text"]
-        .as_str()
-        .expect("invalid message content");
-
-    assert!(
-        content.ends_with(text),
-        "expected message content '{content}' to end with '{text}'"
-    );
+#[expect(clippy::unwrap_used)]
+fn message_input_texts(item: &serde_json::Value) -> Vec<&str> {
+    item["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry.get("text").and_then(|text| text.as_str()))
+        .collect()
 }
 
 /// Writes an `auth.json` into the provided `codex_home` with the specified parameters.
@@ -196,6 +173,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
             text: "resumed user message".to_string(),
         }],
         end_turn: None,
+        phase: None,
     };
     let prior_user_json = serde_json::to_value(&prior_user).unwrap();
     writeln!(
@@ -217,6 +195,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
             text: "resumed system instruction".to_string(),
         }],
         end_turn: None,
+        phase: None,
     };
     let prior_system_json = serde_json::to_value(&prior_system).unwrap();
     writeln!(
@@ -238,6 +217,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
             text: "resumed assistant message".to_string(),
         }],
         end_turn: None,
+        phase: Some(MessagePhase::Commentary),
     };
     let prior_item_json = serde_json::to_value(&prior_item).unwrap();
     writeln!(
@@ -254,34 +234,26 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
 
     // Mock server that will receive the resumed request
     let server = MockServer::start().await;
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
 
     // Configure Codex to resume from our file
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.model_provider = model_provider;
-    // Also configure user instructions to ensure they are NOT delivered on resume.
-    config.user_instructions = Some("be nice".to_string());
-
-    let thread_manager = ThreadManager::with_models_provider_and_home(
-        CodexAuth::from_api_key("Test API Key"),
-        config.model_provider.clone(),
-        config.codex_home.clone(),
-    );
-    let auth_manager =
-        codex_core::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let NewThread {
-        thread: codex,
-        session_configured,
-        ..
-    } = thread_manager
-        .resume_thread_from_rollout(config, session_path.clone(), auth_manager)
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let mut builder = test_codex()
+        .with_home(codex_home.clone())
+        .with_config(|config| {
+            // Ensure user instructions are NOT delivered on resume.
+            config.user_instructions = Some("be nice".to_string());
+        });
+    let test = builder
+        .resume(&server, codex_home, session_path.clone())
         .await
         .expect("resume conversation");
+    let codex = test.codex.clone();
+    let session_configured = test.session_configured;
 
     // 1) Assert initial_messages only includes existing EventMsg entries; response items are not converted
     let initial_msgs = session_configured
@@ -308,19 +280,15 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
     let request = resp_mock.single_request();
     let request_body = request.body_json();
     let input = request_body["input"].as_array().expect("input array");
-    let messages: Vec<(String, String)> = input
-        .iter()
-        .filter_map(|item| {
-            let role = item.get("role")?.as_str()?;
-            let text = item
-                .get("content")?
-                .as_array()?
-                .first()?
-                .get("text")?
-                .as_str()?;
-            Some((role.to_string(), text.to_string()))
-        })
-        .collect();
+    let mut messages: Vec<(String, String)> = Vec::new();
+    for item in input {
+        let Some(role) = item.get("role").and_then(|role| role.as_str()) else {
+            continue;
+        };
+        for text in message_input_texts(item) {
+            messages.push((role.to_string(), text.to_string()));
+        }
+    }
     let pos_prior_user = messages
         .iter()
         .position(|(role, text)| role == "user" && text == "resumed user message")
@@ -329,17 +297,35 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         .iter()
         .position(|(role, text)| role == "assistant" && text == "resumed assistant message")
         .expect("prior assistant message");
+    let prior_assistant = input
+        .iter()
+        .find(|item| {
+            item.get("role").and_then(|role| role.as_str()) == Some("assistant")
+                && item
+                    .get("content")
+                    .and_then(|content| content.as_array())
+                    .and_then(|content| content.first())
+                    .and_then(|entry| entry.get("text"))
+                    .and_then(|text| text.as_str())
+                    == Some("resumed assistant message")
+        })
+        .expect("resumed assistant message request item");
+    assert_eq!(
+        prior_assistant
+            .get("phase")
+            .and_then(|phase| phase.as_str()),
+        Some("commentary")
+    );
     let pos_permissions = messages
         .iter()
-        .position(|(role, text)| role == "developer" && text.contains("`approval_policy`"))
+        .position(|(role, text)| role == "developer" && text.contains("<permissions instructions>"))
         .expect("permissions message");
     let pos_user_instructions = messages
         .iter()
         .position(|(role, text)| {
             role == "user"
                 && text.contains("be nice")
-                && (text.starts_with("# AGENTS.md instructions for ")
-                    || text.starts_with("<user_instructions>"))
+                && (text.starts_with("# AGENTS.md instructions for "))
         })
         .expect("user instructions");
     let pos_environment = messages
@@ -365,32 +351,19 @@ async fn includes_conversation_id_and_model_headers_in_request() {
     // Mock server
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
 
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-
-    // Init session
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.model_provider = model_provider;
-
-    let thread_manager = ThreadManager::with_models_provider_and_home(
-        CodexAuth::from_api_key("Test API Key"),
-        config.model_provider.clone(),
-        config.codex_home.clone(),
-    );
-    let NewThread {
-        thread: codex,
-        thread_id: session_id,
-        session_configured: _,
-        ..
-    } = thread_manager
-        .start_thread(config)
+    let mut builder = test_codex().with_auth(CodexAuth::from_api_key("Test API Key"));
+    let test = builder
+        .build(&server)
         .await
         .expect("create new conversation");
+    let codex = test.codex.clone();
+    let session_id = test.session_configured.session_id;
 
     codex
         .submit(Op::UserInput {
@@ -423,28 +396,22 @@ async fn includes_base_instructions_override_in_request() {
     skip_if_no_network!();
     // Mock server
     let server = MockServer::start().await;
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
 
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home).await;
-
-    config.base_instructions = Some("test instructions".to_string());
-    config.model_provider = model_provider;
-
-    let thread_manager = ThreadManager::with_models_provider_and_home(
-        CodexAuth::from_api_key("Test API Key"),
-        config.model_provider.clone(),
-        config.codex_home.clone(),
-    );
-    let codex = thread_manager
-        .start_thread(config)
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_config(|config| {
+            config.base_instructions = Some("test instructions".to_string());
+        });
+    let codex = builder
+        .build(&server)
         .await
         .expect("create new conversation")
-        .thread;
+        .codex;
 
     codex
         .submit(Op::UserInput {
@@ -477,31 +444,25 @@ async fn chatgpt_auth_sends_correct_request() {
     // Mock server
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
 
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/api/codex", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-
-    // Init session
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.model_provider = model_provider;
-    let thread_manager = ThreadManager::with_models_provider_and_home(
-        create_dummy_codex_auth(),
-        config.model_provider.clone(),
-        config.codex_home.clone(),
-    );
-    let NewThread {
-        thread: codex,
-        thread_id,
-        session_configured: _,
-        ..
-    } = thread_manager
-        .start_thread(config)
+    let mut model_provider = built_in_model_providers()["openai"].clone();
+    model_provider.base_url = Some(format!("{}/api/codex", server.uri()));
+    let mut builder = test_codex()
+        .with_auth(create_dummy_codex_auth())
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+        });
+    let test = builder
+        .build(&server)
         .await
         .expect("create new conversation");
+    let codex = test.codex.clone();
+    let thread_id = test.session_configured.session_id;
 
     codex
         .submit(Op::UserInput {
@@ -549,7 +510,10 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
 
     let first = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
-        .set_body_raw(sse_completed("resp1"), "text/event-stream");
+        .set_body_raw(
+            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+            "text/event-stream",
+        );
 
     // Expect API key header, no ChatGPT account header required.
     Mock::given(method("POST"))
@@ -582,7 +546,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
 
     let auth_manager =
         match CodexAuth::from_auth_storage(codex_home.path(), AuthCredentialsStoreMode::File) {
-            Ok(Some(auth)) => codex_core::AuthManager::from_auth_for_testing(auth),
+            Ok(Some(auth)) => codex_core::test_support::auth_manager_from_auth(auth),
             Ok(None) => panic!("No CodexAuth found in codex_home"),
             Err(e) => panic!("Failed to load CodexAuth: {e}"),
         };
@@ -590,6 +554,12 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
         codex_home.path().to_path_buf(),
         auth_manager,
         SessionSource::Exec,
+        config.model_catalog.clone(),
+        CollaborationModesConfig {
+            default_mode_request_user_input: config
+                .features
+                .enabled(Feature::DefaultModeRequestUserInput),
+        },
     );
     let NewThread { thread: codex, .. } = thread_manager
         .start_thread(config)
@@ -615,28 +585,22 @@ async fn includes_user_instructions_message_in_request() {
     skip_if_no_network!();
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
 
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.model_provider = model_provider;
-    config.user_instructions = Some("be nice".to_string());
-
-    let thread_manager = ThreadManager::with_models_provider_and_home(
-        CodexAuth::from_api_key("Test API Key"),
-        config.model_provider.clone(),
-        config.codex_home.clone(),
-    );
-    let codex = thread_manager
-        .start_thread(config)
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_config(|config| {
+            config.user_instructions = Some("be nice".to_string());
+        });
+    let codex = builder
+        .build(&server)
         .await
         .expect("create new conversation")
-        .thread;
+        .codex;
 
     codex
         .submit(Op::UserInput {
@@ -670,16 +634,112 @@ async fn includes_user_instructions_message_in_request() {
     );
 
     assert_message_role(&request_body["input"][1], "user");
-    assert_message_starts_with(&request_body["input"][1], "# AGENTS.md instructions for ");
-    assert_message_ends_with(&request_body["input"][1], "</INSTRUCTIONS>");
-    let ui_text = request_body["input"][1]["content"][0]["text"]
-        .as_str()
+    let user_context_texts = message_input_texts(&request_body["input"][1]);
+    assert!(
+        user_context_texts
+            .iter()
+            .any(|text| text.starts_with("# AGENTS.md instructions for ")),
+        "expected AGENTS text in contextual user message, got {user_context_texts:?}"
+    );
+    let ui_text = user_context_texts
+        .iter()
+        .copied()
+        .find(|text| text.contains("<INSTRUCTIONS>"))
         .expect("invalid message content");
     assert!(ui_text.contains("<INSTRUCTIONS>"));
     assert!(ui_text.contains("be nice"));
-    assert_message_role(&request_body["input"][2], "user");
-    assert_message_starts_with(&request_body["input"][2], "<environment_context>");
-    assert_message_ends_with(&request_body["input"][2], "</environment_context>");
+    assert!(
+        user_context_texts
+            .iter()
+            .any(|text| text.starts_with("<environment_context>")
+                && text.ends_with("</environment_context>")),
+        "expected environment context in contextual user message, got {user_context_texts:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn includes_apps_guidance_as_developer_message_when_enabled() {
+    skip_if_no_network!();
+    let server = MockServer::start().await;
+    let apps_server = AppsTestServer::mount(&server)
+        .await
+        .expect("mount apps MCP mock");
+    let apps_base_url = apps_server.chatgpt_base_url.clone();
+
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_config(move |config| {
+            config.features.enable(Feature::Apps);
+            config.features.disable(Feature::AppsMcpGateway);
+            config.chatgpt_base_url = apps_base_url;
+        });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("create new conversation")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = resp_mock.single_request();
+    let request_body = request.body_json();
+    let input = request_body["input"].as_array().expect("input array");
+    let apps_snippet = "Apps are mentioned in the prompt in the format";
+
+    let has_developer_apps_guidance = input.iter().any(|item| {
+        item.get("role").and_then(|value| value.as_str()) == Some("developer")
+            && item
+                .get("content")
+                .and_then(|value| value.as_array())
+                .is_some_and(|content| {
+                    content.iter().any(|entry| {
+                        entry
+                            .get("text")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|text| text.contains(apps_snippet))
+                    })
+                })
+    });
+    assert!(
+        has_developer_apps_guidance,
+        "expected apps guidance in a developer message, got {input:#?}"
+    );
+
+    let has_user_apps_guidance = input.iter().any(|item| {
+        item.get("role").and_then(|value| value.as_str()) == Some("user")
+            && item
+                .get("content")
+                .and_then(|value| value.as_array())
+                .is_some_and(|content| {
+                    content.iter().any(|entry| {
+                        entry
+                            .get("text")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|text| text.contains(apps_snippet))
+                    })
+                })
+    });
+    assert!(
+        !has_user_apps_guidance,
+        "did not expect apps guidance in user messages, got {input:#?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -687,14 +747,13 @@ async fn skills_append_to_instructions() {
     skip_if_no_network!();
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
 
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-
-    let codex_home = TempDir::new().unwrap();
+    let codex_home = Arc::new(TempDir::new().unwrap());
     let skill_dir = codex_home.path().join("skills/demo");
     std::fs::create_dir_all(&skill_dir).expect("create skill dir");
     std::fs::write(
@@ -703,20 +762,18 @@ async fn skills_append_to_instructions() {
     )
     .expect("write skill");
 
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.model_provider = model_provider;
-    config.cwd = codex_home.path().to_path_buf();
-
-    let thread_manager = ThreadManager::with_models_provider_and_home(
-        CodexAuth::from_api_key("Test API Key"),
-        config.model_provider.clone(),
-        config.codex_home.clone(),
-    );
-    let codex = thread_manager
-        .start_thread(config)
+    let codex_home_path = codex_home.path().to_path_buf();
+    let mut builder = test_codex()
+        .with_home(codex_home.clone())
+        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_config(move |config| {
+            config.cwd = codex_home_path;
+        });
+    let codex = builder
+        .build(&server)
         .await
         .expect("create new conversation")
-        .thread;
+        .codex;
 
     codex
         .submit(Op::UserInput {
@@ -762,7 +819,11 @@ async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
     let TestCodex { codex, .. } = test_codex()
         .with_model("gpt-5.1-codex")
         .with_config(|config| {
@@ -803,7 +864,11 @@ async fn includes_no_effort_in_request() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
     let TestCodex { codex, .. } = test_codex()
         .with_model("gpt-5.1-codex")
         .build(&server)
@@ -842,7 +907,11 @@ async fn includes_default_reasoning_effort_in_request_when_defined_by_model_info
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
     let TestCodex { codex, .. } = test_codex().with_model("gpt-5.1").build(&server).await?;
 
     codex
@@ -877,7 +946,11 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
     let TestCodex {
         codex,
         config,
@@ -889,7 +962,7 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
         .await?;
 
     let collaboration_mode = CollaborationMode {
-        mode: ModeKind::Custom,
+        mode: ModeKind::Default,
         settings: Settings {
             model: "gpt-5.1".to_string(),
             reasoning_effort: Some(ReasoningEffort::High),
@@ -904,11 +977,15 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
                 text_elements: Vec::new(),
             }],
             cwd: config.cwd.clone(),
-            approval_policy: config.approval_policy.value(),
-            sandbox_policy: config.sandbox_policy.get().clone(),
+            approval_policy: config.permissions.approval_policy.value(),
+            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
             model: session_configured.model.clone(),
             effort: Some(ReasoningEffort::Low),
-            summary: config.model_reasoning_summary,
+            summary: Some(
+                config
+                    .model_reasoning_summary
+                    .unwrap_or(ReasoningSummary::Auto),
+            ),
             collaboration_mode: Some(collaboration_mode),
             final_output_json_schema: None,
             personality: None,
@@ -935,10 +1012,14 @@ async fn configured_reasoning_summary_is_sent() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
-            config.model_reasoning_summary = ReasoningSummary::Concise;
+            config.model_reasoning_summary = Some(ReasoningSummary::Concise);
         })
         .build(&server)
         .await?;
@@ -971,14 +1052,87 @@ async fn configured_reasoning_summary_is_sent() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+
+    let mut model_catalog: ModelsResponse =
+        serde_json::from_str(include_str!("../../models.json")).expect("valid models.json");
+    let model = model_catalog
+        .models
+        .iter_mut()
+        .find(|model| model.slug == "gpt-5.1")
+        .expect("gpt-5.1 exists in bundled models.json");
+    model.supports_reasoning_summaries = true;
+    model.default_reasoning_summary = ReasoningSummary::Detailed;
+
+    let TestCodex {
+        codex,
+        config,
+        session_configured,
+        ..
+    } = test_codex()
+        .with_model("gpt-5.1")
+        .with_config(move |config| {
+            config.model_catalog = Some(model_catalog);
+        })
+        .build(&server)
+        .await?;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            cwd: config.cwd.clone(),
+            approval_policy: config.permissions.approval_policy.value(),
+            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            model: session_configured.model,
+            effort: None,
+            summary: Some(ReasoningSummary::Concise),
+            collaboration_mode: None,
+            final_output_json_schema: None,
+            personality: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request_body = resp_mock.single_request().body_json();
+
+    pretty_assertions::assert_eq!(
+        request_body
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("summary"))
+            .and_then(|value| value.as_str()),
+        Some("concise")
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reasoning_summary_is_omitted_when_disabled() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
-            config.model_reasoning_summary = ReasoningSummary::None;
+            config.model_reasoning_summary = Some(ReasoningSummary::None);
         })
         .build(&server)
         .await?;
@@ -1010,11 +1164,69 @@ async fn reasoning_summary_is_omitted_when_disabled() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+
+    let mut model_catalog: ModelsResponse =
+        serde_json::from_str(include_str!("../../models.json")).expect("valid models.json");
+    let model = model_catalog
+        .models
+        .iter_mut()
+        .find(|model| model.slug == "gpt-5.1")
+        .expect("gpt-5.1 exists in bundled models.json");
+    model.supports_reasoning_summaries = true;
+    model.default_reasoning_summary = ReasoningSummary::Detailed;
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_model("gpt-5.1")
+        .with_config(move |config| {
+            config.model_reasoning_summary = Some(ReasoningSummary::None);
+            config.model_catalog = Some(model_catalog);
+        })
+        .build(&server)
+        .await?;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request_body = resp_mock.single_request().body_json();
+    pretty_assertions::assert_eq!(
+        request_body
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("summary")),
+        None
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_default_verbosity_in_request() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
     let TestCodex { codex, .. } = test_codex().with_model("gpt-5.1").build(&server).await?;
 
     codex
@@ -1049,7 +1261,11 @@ async fn configured_verbosity_not_sent_for_models_without_support() -> anyhow::R
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
     let TestCodex { codex, .. } = test_codex()
         .with_model("gpt-5.1-codex")
         .with_config(|config| {
@@ -1089,7 +1305,11 @@ async fn configured_verbosity_is_sent() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
     let TestCodex { codex, .. } = test_codex()
         .with_model("gpt-5.1")
         .with_config(|config| {
@@ -1130,29 +1350,22 @@ async fn includes_developer_instructions_message_in_request() {
     skip_if_no_network!();
     let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
-
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.model_provider = model_provider;
-    config.user_instructions = Some("be nice".to_string());
-    config.developer_instructions = Some("be useful".to_string());
-
-    let thread_manager = ThreadManager::with_models_provider_and_home(
-        CodexAuth::from_api_key("Test API Key"),
-        config.model_provider.clone(),
-        config.codex_home.clone(),
-    );
-    let codex = thread_manager
-        .start_thread(config)
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_config(|config| {
+            config.user_instructions = Some("be nice".to_string());
+            config.developer_instructions = Some("be useful".to_string());
+        });
+    let codex = builder
+        .build(&server)
         .await
         .expect("create new conversation")
-        .thread;
+        .codex;
 
     codex
         .submit(Op::UserInput {
@@ -1186,19 +1399,42 @@ async fn includes_developer_instructions_message_in_request() {
         "expected permissions message to mention sandbox_mode, got {permissions_text:?}"
     );
 
-    assert_message_role(&request_body["input"][1], "developer");
-    assert_message_equals(&request_body["input"][1], "be useful");
-    assert_message_role(&request_body["input"][2], "user");
-    assert_message_starts_with(&request_body["input"][2], "# AGENTS.md instructions for ");
-    assert_message_ends_with(&request_body["input"][2], "</INSTRUCTIONS>");
-    let ui_text = request_body["input"][2]["content"][0]["text"]
-        .as_str()
+    let developer_messages: Vec<&serde_json::Value> = request_body["input"]
+        .as_array()
+        .expect("input array")
+        .iter()
+        .filter(|item| item.get("role").and_then(|role| role.as_str()) == Some("developer"))
+        .collect();
+    assert!(
+        developer_messages
+            .iter()
+            .any(|item| message_input_texts(item).contains(&"be useful")),
+        "expected developer instructions in a developer message, got {:?}",
+        request_body["input"]
+    );
+
+    assert_message_role(&request_body["input"][1], "user");
+    let user_context_texts = message_input_texts(&request_body["input"][1]);
+    assert!(
+        user_context_texts
+            .iter()
+            .any(|text| text.starts_with("# AGENTS.md instructions for ")),
+        "expected AGENTS text in contextual user message, got {user_context_texts:?}"
+    );
+    let ui_text = user_context_texts
+        .iter()
+        .copied()
+        .find(|text| text.contains("<INSTRUCTIONS>"))
         .expect("invalid message content");
     assert!(ui_text.contains("<INSTRUCTIONS>"));
     assert!(ui_text.contains("be nice"));
-    assert_message_role(&request_body["input"][3], "user");
-    assert_message_starts_with(&request_body["input"][3], "<environment_context>");
-    assert_message_ends_with(&request_body["input"][3], "</environment_context>");
+    assert!(
+        user_context_texts
+            .iter()
+            .any(|text| text.starts_with("<environment_context>")
+                && text.ends_with("</environment_context>")),
+        "expected environment context in contextual user message, got {user_context_texts:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1227,6 +1463,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         stream_max_retries: Some(0),
         stream_idle_timeout_ms: Some(5_000),
         requires_openai_auth: false,
+        supports_websockets: false,
     };
 
     let codex_home = TempDir::new().unwrap();
@@ -1235,36 +1472,39 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
     config.model_provider = provider.clone();
     let effort = config.model_reasoning_effort;
     let summary = config.model_reasoning_summary;
-    let model = ModelsManager::get_model_offline(config.model.as_deref());
+    let model = codex_core::test_support::get_model_offline(config.model.as_deref());
     config.model = Some(model.clone());
     let config = Arc::new(config);
-    let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
+    let model_info =
+        codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
     let conversation_id = ThreadId::new();
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let auth_manager =
+        codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("Test API Key"));
     let otel_manager = OtelManager::new(
         conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
         None,
         Some("test@test.com".to_string()),
-        auth_manager.get_auth_mode(),
+        auth_manager.auth_mode().map(TelemetryAuthMode::from),
+        "test_originator".to_string(),
         false,
         "test".to_string(),
         SessionSource::Exec,
     );
 
-    let mut client = ModelClient::new(
-        Arc::clone(&config),
+    let client = ModelClient::new(
         None,
-        model_info,
-        otel_manager,
-        provider,
-        effort,
-        summary,
         conversation_id,
+        provider.clone(),
         SessionSource::Exec,
-    )
-    .new_session();
+        config.model_verbosity,
+        None::<ResponsesWebsocketVersion>,
+        false,
+        false,
+        None,
+    );
+    let mut client_session = client.new_session();
 
     let mut prompt = Prompt::default();
     prompt.input.push(ResponseItem::Reasoning {
@@ -1284,13 +1524,15 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
             text: "message".into(),
         }],
         end_turn: None,
+        phase: None,
     });
     prompt.input.push(ResponseItem::WebSearchCall {
         id: Some("web-search-id".into()),
         status: Some("completed".into()),
-        action: WebSearchAction::Search {
+        action: Some(WebSearchAction::Search {
             query: Some("weather".into()),
-        },
+            queries: None,
+        }),
     });
     prompt.input.push(ResponseItem::FunctionCall {
         id: Some("function-id".into()),
@@ -1300,10 +1542,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
     });
     prompt.input.push(ResponseItem::FunctionCallOutput {
         call_id: "function-call-id".into(),
-        output: FunctionCallOutputPayload {
-            content: "ok".into(),
-            ..Default::default()
-        },
+        output: FunctionCallOutputPayload::from_text("ok".into()),
     });
     prompt.input.push(ResponseItem::LocalShellCall {
         id: Some("local-shell-id".into()),
@@ -1329,8 +1568,15 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         output: "ok".into(),
     });
 
-    let mut stream = client
-        .stream(&prompt)
+    let mut stream = client_session
+        .stream(
+            &prompt,
+            &model_info,
+            &otel_manager,
+            effort,
+            summary.unwrap_or(ReasoningSummary::Auto),
+            None,
+        )
         .await
         .expect("responses stream to start");
 
@@ -1390,20 +1636,16 @@ async fn token_count_includes_rate_limits_snapshot() {
     let mut provider = built_in_model_providers()["openai"].clone();
     provider.base_url = Some(format!("{}/v1", server.uri()));
 
-    let home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&home).await;
-    config.model_provider = provider;
-
-    let thread_manager = ThreadManager::with_models_provider_and_home(
-        CodexAuth::from_api_key("test"),
-        config.model_provider.clone(),
-        config.codex_home.clone(),
-    );
-    let codex = thread_manager
-        .start_thread(config)
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("test"))
+        .with_config(move |config| {
+            config.model_provider = provider;
+        });
+    let codex = builder
+        .build(&server)
         .await
         .expect("create conversation")
-        .thread;
+        .codex;
 
     codex
         .submit(Op::UserInput {
@@ -1429,6 +1671,8 @@ async fn token_count_includes_rate_limits_snapshot() {
         json!({
             "info": null,
             "rate_limits": {
+                "limit_id": "codex",
+                "limit_name": null,
                 "primary": {
                     "used_percent": 12.5,
                     "window_minutes": 10,
@@ -1478,6 +1722,8 @@ async fn token_count_includes_rate_limits_snapshot() {
                 "model_context_window": 258400
             },
             "rate_limits": {
+                "limit_id": "codex",
+                "limit_name": null,
                 "primary": {
                     "used_percent": 12.5,
                     "window_minutes": 10,
@@ -1550,6 +1796,8 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
     let codex = codex_fixture.codex.clone();
 
     let expected_limits = json!({
+        "limit_id": "codex",
+        "limit_name": null,
         "primary": {
             "used_percent": 100.0,
             "window_minutes": 15,
@@ -1623,7 +1871,10 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
     mount_sse_once_match(
         &server,
         body_string_contains("seed turn"),
-        sse_completed("resp_seed"),
+        sse(vec![
+            ev_response_created("resp_seed"),
+            ev_completed("resp_seed"),
+        ]),
     )
     .await;
 
@@ -1699,6 +1950,64 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+
+    let incomplete_response = sse(vec![
+        ev_response_created("resp_incomplete"),
+        ev_message_item_added("msg_incomplete", "partial content"),
+        ev_output_text_delta("continued chunk"),
+        json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_incomplete",
+                "object": "response",
+                "status": "incomplete",
+                "error": null,
+                "incomplete_details": {
+                    "reason": "content_filter"
+                }
+            }
+        }),
+    ]);
+
+    let responses_mock = mount_sse_once(&server, incomplete_response).await;
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(|config| {
+            config.model_provider.stream_max_retries = Some(0);
+        })
+        .build(&server)
+        .await?;
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "trigger incomplete".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+
+    let error_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
+    assert!(
+        matches!(
+            error_event,
+            EventMsg::Error(ref err)
+                if err.message
+                    == "stream disconnected before completion: Incomplete response returned, reason: content_filter"
+        ),
+        "expected incomplete content filter error; got {error_event:?}"
+    );
+
+    assert_eq!(responses_mock.requests().len(), 1);
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn azure_overrides_assign_properties_used_for_responses_url() {
     skip_if_no_network!();
     let existing_env_var_with_random_value = if cfg!(windows) { "USERNAME" } else { "USER" };
@@ -1709,7 +2018,10 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
     // First request – must NOT include `previous_response_id`.
     let first = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
-        .set_body_raw(sse_completed("resp1"), "text/event-stream");
+        .set_body_raw(
+            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+            "text/event-stream",
+        );
 
     // Expect POST to /openai/responses with api-version query param
     Mock::given(method("POST"))
@@ -1750,23 +2062,20 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
+        supports_websockets: false,
     };
 
     // Init session
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.model_provider = provider;
-
-    let thread_manager = ThreadManager::with_models_provider_and_home(
-        create_dummy_codex_auth(),
-        config.model_provider.clone(),
-        config.codex_home.clone(),
-    );
-    let codex = thread_manager
-        .start_thread(config)
+    let mut builder = test_codex()
+        .with_auth(create_dummy_codex_auth())
+        .with_config(move |config| {
+            config.model_provider = provider;
+        });
+    let codex = builder
+        .build(&server)
         .await
         .expect("create new conversation")
-        .thread;
+        .codex;
 
     codex
         .submit(Op::UserInput {
@@ -1793,7 +2102,10 @@ async fn env_var_overrides_loaded_auth() {
     // First request – must NOT include `previous_response_id`.
     let first = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
-        .set_body_raw(sse_completed("resp1"), "text/event-stream");
+        .set_body_raw(
+            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+            "text/event-stream",
+        );
 
     // Expect POST to /openai/responses with api-version query param
     Mock::given(method("POST"))
@@ -1834,23 +2146,20 @@ async fn env_var_overrides_loaded_auth() {
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
+        supports_websockets: false,
     };
 
     // Init session
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.model_provider = provider;
-
-    let thread_manager = ThreadManager::with_models_provider_and_home(
-        create_dummy_codex_auth(),
-        config.model_provider.clone(),
-        config.codex_home.clone(),
-    );
-    let codex = thread_manager
-        .start_thread(config)
+    let mut builder = test_codex()
+        .with_auth(create_dummy_codex_auth())
+        .with_config(move |config| {
+            config.model_provider = provider;
+        });
+    let codex = builder
+        .build(&server)
         .await
         .expect("create new conversation")
-        .thread;
+        .codex;
 
     codex
         .submit(Op::UserInput {
@@ -1905,26 +2214,12 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
 
     let request_log = mount_sse_sequence(&server, vec![sse1.clone(), sse1.clone(), sse1]).await;
 
-    // Configure provider to point to mock server (Responses API) and use API key auth.
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-
-    // Init session with isolated codex home.
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.model_provider = model_provider;
-
-    let thread_manager = ThreadManager::with_models_provider_and_home(
-        CodexAuth::from_api_key("Test API Key"),
-        config.model_provider.clone(),
-        config.codex_home.clone(),
-    );
-    let NewThread { thread: codex, .. } = thread_manager
-        .start_thread(config)
+    let mut builder = test_codex().with_auth(CodexAuth::from_api_key("Test API Key"));
+    let codex = builder
+        .build(&server)
         .await
-        .expect("create new conversation");
+        .expect("create new conversation")
+        .codex;
 
     // Turn 1: user sends U1; wait for completion.
     codex

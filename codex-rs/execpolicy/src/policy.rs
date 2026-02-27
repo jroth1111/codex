@@ -1,11 +1,14 @@
 use crate::decision::Decision;
 use crate::error::Error;
 use crate::error::Result;
+use crate::rule::NetworkRule;
+use crate::rule::NetworkRuleProtocol;
 use crate::rule::PatternToken;
 use crate::rule::PrefixPattern;
 use crate::rule::PrefixRule;
 use crate::rule::RuleMatch;
 use crate::rule::RuleRef;
+use crate::rule::normalize_network_rule_host;
 use multimap::MultiMap;
 use serde::Deserialize;
 use serde::Serialize;
@@ -16,11 +19,22 @@ type HeuristicsFallback<'a> = Option<&'a dyn Fn(&[String]) -> Decision>;
 #[derive(Clone, Debug)]
 pub struct Policy {
     rules_by_program: MultiMap<String, RuleRef>,
+    network_rules: Vec<NetworkRule>,
 }
 
 impl Policy {
     pub fn new(rules_by_program: MultiMap<String, RuleRef>) -> Self {
-        Self { rules_by_program }
+        Self::from_parts(rules_by_program, Vec::new())
+    }
+
+    pub fn from_parts(
+        rules_by_program: MultiMap<String, RuleRef>,
+        network_rules: Vec<NetworkRule>,
+    ) -> Self {
+        Self {
+            rules_by_program,
+            network_rules,
+        }
     }
 
     pub fn empty() -> Self {
@@ -29,6 +43,34 @@ impl Policy {
 
     pub fn rules(&self) -> &MultiMap<String, RuleRef> {
         &self.rules_by_program
+    }
+
+    pub fn network_rules(&self) -> &[NetworkRule] {
+        &self.network_rules
+    }
+
+    pub fn get_allowed_prefixes(&self) -> Vec<Vec<String>> {
+        let mut prefixes = Vec::new();
+
+        for (_program, rules) in self.rules_by_program.iter_all() {
+            for rule in rules {
+                let Some(prefix_rule) = rule.as_any().downcast_ref::<PrefixRule>() else {
+                    continue;
+                };
+                if prefix_rule.decision != Decision::Allow {
+                    continue;
+                }
+
+                let mut prefix = Vec::with_capacity(prefix_rule.pattern.rest.len() + 1);
+                prefix.push(prefix_rule.pattern.first.as_ref().to_string());
+                prefix.extend(prefix_rule.pattern.rest.iter().map(render_pattern_token));
+                prefixes.push(prefix);
+            }
+        }
+
+        prefixes.sort();
+        prefixes.dedup();
+        prefixes
     }
 
     pub fn add_prefix_rule(&mut self, prefix: &[String], decision: Decision) -> Result<()> {
@@ -51,6 +93,51 @@ impl Policy {
 
         self.rules_by_program.insert(first_token.clone(), rule);
         Ok(())
+    }
+
+    pub fn add_network_rule(
+        &mut self,
+        host: &str,
+        protocol: NetworkRuleProtocol,
+        decision: Decision,
+        justification: Option<String>,
+    ) -> Result<()> {
+        let host = normalize_network_rule_host(host)?;
+        if let Some(raw) = justification.as_deref()
+            && raw.trim().is_empty()
+        {
+            return Err(Error::InvalidRule(
+                "justification cannot be empty".to_string(),
+            ));
+        }
+        self.network_rules.push(NetworkRule {
+            host,
+            protocol,
+            decision,
+            justification,
+        });
+        Ok(())
+    }
+
+    pub fn compiled_network_domains(&self) -> (Vec<String>, Vec<String>) {
+        let mut allowed = Vec::new();
+        let mut denied = Vec::new();
+
+        for rule in &self.network_rules {
+            match rule.decision {
+                Decision::Allow => {
+                    denied.retain(|entry| entry != &rule.host);
+                    upsert_domain(&mut allowed, &rule.host);
+                }
+                Decision::Forbidden => {
+                    allowed.retain(|entry| entry != &rule.host);
+                    upsert_domain(&mut denied, &rule.host);
+                }
+                Decision::Prompt => {}
+            }
+        }
+
+        (allowed, denied)
     }
 
     pub fn check<F>(&self, cmd: &[String], heuristics_fallback: &F) -> Evaluation
@@ -113,6 +200,18 @@ impl Policy {
         } else {
             matched_rules
         }
+    }
+}
+
+fn upsert_domain(entries: &mut Vec<String>, host: &str) {
+    entries.retain(|entry| entry != host);
+    entries.push(host.to_string());
+}
+
+fn render_pattern_token(token: &PatternToken) -> String {
+    match token {
+        PatternToken::Single(value) => value.clone(),
+        PatternToken::Alts(alternatives) => format!("[{}]", alternatives.join("|")),
     }
 }
 

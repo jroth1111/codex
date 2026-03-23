@@ -40,6 +40,7 @@ mod app_cmd;
 #[cfg(target_os = "macos")]
 mod desktop_app;
 mod mcp_cmd;
+mod team_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
@@ -96,6 +97,9 @@ enum Subcommand {
 
     /// Remove stored authentication credentials.
     Logout(LogoutCommand),
+
+    /// Manage team accounts and member OAuth tokens.
+    Team(team_cmd::TeamCommand),
 
     /// Manage external MCP servers for Codex.
     Mcp(McpCli),
@@ -731,6 +735,9 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 logout_cli.all_accounts,
             )
             .await;
+        }
+        Some(Subcommand::Team(team_cli)) => {
+            team_cli.run().await?;
         }
         Some(Subcommand::Completion(completion_cli)) => {
             print_completion(completion_cli);

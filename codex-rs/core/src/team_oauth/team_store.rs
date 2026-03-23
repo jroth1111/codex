@@ -3,10 +3,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
-use std::path::PathBuf;
 use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::token_data::TokenData;
 
@@ -48,6 +47,7 @@ pub struct TeamMember {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TeamRole {
+    Owner,
     Admin,
     Member,
 }
@@ -55,6 +55,7 @@ pub enum TeamRole {
 impl std::fmt::Display for TeamRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TeamRole::Owner => write!(f, "Owner"),
             TeamRole::Admin => write!(f, "Admin"),
             TeamRole::Member => write!(f, "Member"),
         }
@@ -183,7 +184,7 @@ impl TeamAccount {
     pub fn invite_member(&mut self, email: String, role: TeamRole) -> TeamMember {
         let member = TeamMember {
             id: uuid::Uuid::new_v4().to_string(),
-            email,
+            email: email.clone(),
             tokens: None,
             invited_at: Utc::now(),
             logged_in_at: None,
@@ -212,5 +213,56 @@ impl TeamAccount {
     /// List members with OAuth tokens (logged in).
     pub fn active_members(&self) -> Vec<&TeamMember> {
         self.members.iter().filter(|m| m.tokens.is_some()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn sample_tokens() -> TokenData {
+        TokenData::default()
+    }
+
+    #[test]
+    fn test_create_team() {
+        let team = TeamAccount::new("Test Team".to_string(), sample_tokens());
+        assert_eq!(team.name, "Test Team");
+        assert!(!team.id.is_empty());
+        assert!(team.members.is_empty());
+    }
+
+    #[test]
+    fn test_invite_member() {
+        let mut team = TeamAccount::new("Test Team".to_string(), sample_tokens());
+        let member = team.invite_member("user@example.com".to_string(), TeamRole::Member);
+
+        assert_eq!(member.email, "user@example.com");
+        assert!(member.tokens.is_none());
+        assert_eq!(team.members.len(), 1);
+    }
+
+    #[test]
+    fn test_pending_members() {
+        let mut team = TeamAccount::new("Test Team".to_string(), sample_tokens());
+        team.invite_member("pending@example.com".to_string(), TeamRole::Member);
+
+        assert_eq!(team.pending_members().len(), 1);
+        assert_eq!(team.active_members().len(), 0);
+    }
+
+    #[test]
+    fn test_team_store_save_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = TeamStore::load(temp_dir.path()).unwrap();
+
+        let team = TeamAccount::new("Test Team".to_string(), sample_tokens());
+        let team_id = team.id.clone();
+        store.add_team(team);
+        store.save().unwrap();
+
+        let loaded = TeamStore::load(temp_dir.path()).unwrap();
+        assert!(loaded.get_team(&team_id).is_some());
     }
 }

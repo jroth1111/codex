@@ -3,10 +3,15 @@
 use clap::{Args, Parser, Subcommand};
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::config::find_codex_home;
-use codex_core::team_oauth::{TeamOAuthAutomation, TeamRole};
-use codex_core::token_data::{IdTokenInfo, TokenData, parse_chatgpt_jwt_claims};
+use codex_core::team_oauth::{
+    OtpClient, TeamOAuthAutomation, TeamRole,
+};
+use codex_core::token_data::{TokenData, parse_chatgpt_jwt_claims};
 use std::io::{self, BufRead};
 use std::path::PathBuf;
+
+/// Cloudflare account ID for email routing.
+const CF_ACCOUNT_ID: &str = "81f96723a96b1ae6b3f2f2cc7693be33";
 
 /// Manage team accounts and member OAuth tokens.
 #[derive(Debug, Parser)]
@@ -17,6 +22,10 @@ pub struct TeamCommand {
     /// Override OTP worker URL (default: http://chatgpt-email-otp.gwizz.workers.dev)
     #[arg(long = "otp-worker", value_name = "URL", global = true)]
     otp_worker_url: Option<String>,
+
+    /// Cloudflare API token for email access
+    #[arg(long = "cf-token", value_name = "TOKEN", global = true, env = "CF_API_TOKEN")]
+    cf_token: Option<String>,
 
     /// CODEX_HOME directory (default: ~/.codex)
     #[arg(long = "codex-home", value_name = "DIR", global = true, hide = true)]
@@ -45,6 +54,9 @@ enum TeamSubcommand {
 
     /// Full setup: create team, invite members, and auto-login.
     Setup(SetupTeamArgs),
+
+    /// Test OTP client connection.
+    TestOtp,
 }
 
 #[derive(Debug, Args)]
@@ -65,7 +77,7 @@ struct CreateTeamArgs {
     #[arg(long = "id-token", value_name = "TOKEN")]
     id_token: Option<String>,
 
-    /// Read tokens from stdin as JSON ({"access_token": "...", "refresh_token": "...", "id_token": "..."})
+    /// Read tokens from stdin as JSON
     #[arg(long = "stdin")]
     stdin: bool,
 }
@@ -144,11 +156,24 @@ impl TeamCommand {
             None => find_codex_home()?,
         };
 
-        let automation = TeamOAuthAutomation::new(
-            codex_home,
-            AuthCredentialsStoreMode::Auto,
-            self.otp_worker_url.clone(),
-        )?;
+        let automation = match &self.cf_token {
+            Some(token) => {
+                TeamOAuthAutomation::with_cloudflare(
+                    codex_home,
+                    AuthCredentialsStoreMode::Auto,
+                    self.otp_worker_url.clone(),
+                    token.clone(),
+                    CF_ACCOUNT_ID.to_string(),
+                )?
+            }
+            None => {
+                TeamOAuthAutomation::new(
+                    codex_home,
+                    AuthCredentialsStoreMode::Auto,
+                    self.otp_worker_url.clone(),
+                )?
+            }
+        };
 
         match self.subcommand {
             TeamSubcommand::Create(args) => run_create_team(&automation, args).await,
@@ -158,6 +183,7 @@ impl TeamCommand {
             TeamSubcommand::Invite(args) => run_invite_member(&automation, args).await,
             TeamSubcommand::Login(args) => run_login_members(&automation, args).await,
             TeamSubcommand::Setup(args) => run_setup_team(&automation, args).await,
+            TeamSubcommand::TestOtp => run_test_otp(&self).await,
         }
     }
 }
@@ -231,9 +257,10 @@ async fn run_remove_team(automation: &TeamOAuthAutomation, args: RemoveTeamArgs)
 
 async fn run_invite_member(automation: &TeamOAuthAutomation, args: InviteMemberArgs) -> anyhow::Result<()> {
     let role = match args.role.to_lowercase().as_str() {
+        "owner" => TeamRole::Owner,
         "admin" => TeamRole::Admin,
         "member" => TeamRole::Member,
-        _ => anyhow::bail!("Invalid role: {}. Use 'admin' or 'member'.", args.role),
+        _ => anyhow::bail!("Invalid role: {}. Use 'owner', 'admin', or 'member'.", args.role),
     };
 
     let member = automation.invite_member(&args.team_id, args.email.clone(), role).await?;
@@ -243,34 +270,34 @@ async fn run_invite_member(automation: &TeamOAuthAutomation, args: InviteMemberA
 }
 
 async fn run_login_members(automation: &TeamOAuthAutomation, args: LoginMembersArgs) -> anyhow::Result<()> {
-    let team = automation.get_team(&args.team_id).await
-        .ok_or_else(|| anyhow::anyhow!("Team not found: {}", args.team_id))?;
-
-    let members_to_login: Vec<_> = if let Some(email) = &args.email {
-        vec![email.clone()]
-    } else {
-        team.pending_members()
-            .into_iter()
-            .map(|m| m.email.clone())
-            .collect()
-    };
-
-    if members_to_login.is_empty() {
-        eprintln!("No pending members to log in.");
-        return Ok(());
-    }
-
-    eprintln!("Logging in {} member(s)...", members_to_login.len());
-
-    for email in members_to_login {
-        eprintln!("  Logging in {}...", email);
-        match automation.login_member_via_otp(&args.team_id, &email).await {
+    if let Some(email) = &args.email {
+        // Login specific member
+        eprintln!("Logging in member: {}", email);
+        match automation.login_member_via_otp(&args.team_id, email).await {
             Ok(tokens) => {
-                let member_email = tokens.id_token.email.as_deref().unwrap_or(&email);
-                eprintln!("  ✓ Logged in: {}", member_email);
+                let member_email = tokens.id_token.email.as_deref().unwrap_or(email);
+                eprintln!("✓ Successfully logged in: {}", member_email);
             }
             Err(e) => {
-                eprintln!("  ✗ Failed to login {}: {}", email, e);
+                eprintln!("✗ Failed to login {}: {}", email, e);
+                return Err(e.into());
+            }
+        }
+    } else {
+        // Login all pending members
+        let results = automation.login_pending_members(&args.team_id).await?;
+
+        if results.is_empty() {
+            eprintln!("No pending members to log in.");
+            return Ok(());
+        }
+
+        eprintln!("Login results:");
+        for result in &results {
+            if result.success {
+                eprintln!("  ✓ {}", result.email);
+            } else {
+                eprintln!("  ✗ {} - {}", result.email, result.error.as_deref().unwrap_or("unknown error"));
             }
         }
     }
@@ -315,6 +342,43 @@ async fn run_setup_team(automation: &TeamOAuthAutomation, args: SetupTeamArgs) -
     Ok(())
 }
 
+async fn run_test_otp(cmd: &TeamCommand) -> anyhow::Result<()> {
+    let otp_client = match &cmd.cf_token {
+        Some(token) => {
+            OtpClient::with_cloudflare(
+                cmd.otp_worker_url.clone().unwrap_or_else(|| OtpClient::DEFAULT_URL.to_string()),
+                token.clone(),
+                CF_ACCOUNT_ID.to_string(),
+            )
+        }
+        None => {
+            OtpClient::new(cmd.otp_worker_url.clone().unwrap_or_else(|| OtpClient::DEFAULT_URL.to_string()))
+        }
+    };
+
+    eprintln!("Testing OTP client connection...");
+
+    // Test worker health
+    match otp_client.health_check().await {
+        Ok(true) => eprintln!("  ✓ Worker health check passed"),
+        Ok(false) => eprintln!("  ✗ Worker health check failed"),
+        Err(e) => eprintln!("  ✗ Worker health check error: {}", e),
+    }
+
+    // Test email generation
+    let test_email = otp_client.generate_member_email("test");
+    eprintln!("  Generated email: {}", test_email);
+
+    // Test OTP extraction
+    let test_body = "Your verification code is: 123456";
+    match otp_client.extract_otp_from_email(test_body) {
+        Some(otp) => eprintln!("  ✓ OTP extraction test passed: {}", otp),
+        None => eprintln!("  ✗ OTP extraction test failed"),
+    }
+
+    Ok(())
+}
+
 fn read_tokens(
     access_token: &Option<String>,
     refresh_token: &Option<String>,
@@ -336,7 +400,7 @@ fn read_tokens(
             .ok_or_else(|| anyhow::anyhow!("Missing id_token in JSON"))?
             .to_string();
 
-        return Ok(TokenData::from_tokens(access, refresh, id)?);
+        return build_token_data(access, refresh, id);
     }
 
     let access = access_token.clone()
@@ -346,17 +410,15 @@ fn read_tokens(
     let id = id_token.clone()
         .ok_or_else(|| anyhow::anyhow!("--id-token is required (or use --stdin)"))?;
 
-    Ok(TokenData::from_tokens(access, refresh, id)?)
+    build_token_data(access, refresh, id)
 }
 
-impl TokenData {
-    fn from_tokens(access: String, refresh: String, id: String) -> anyhow::Result<Self> {
-        let id_token = parse_chatgpt_jwt_claims(&id)?;
-        Ok(Self {
-            id_token,
-            access_token: access,
-            refresh_token: refresh,
-            account_id: None,
-        })
-    }
+fn build_token_data(access: String, refresh: String, id: String) -> anyhow::Result<TokenData> {
+    let id_token_info = parse_chatgpt_jwt_claims(&id)?;
+    Ok(TokenData {
+        id_token: id_token_info,
+        access_token: access,
+        refresh_token: refresh,
+        account_id: None,
+    })
 }

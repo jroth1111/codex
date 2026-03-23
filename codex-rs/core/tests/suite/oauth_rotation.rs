@@ -1,11 +1,9 @@
 use base64::Engine;
 use codex_core::AuthManager;
-use codex_core::ContentItem;
 use codex_core::ModelClient;
 use codex_core::ModelProviderInfo;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
-use codex_core::ResponseItem;
 use codex_core::WireApi;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
@@ -14,14 +12,20 @@ use codex_core::auth::list_oauth_accounts;
 use codex_core::built_in_model_providers;
 use codex_core::config::Config;
 use codex_core::error::CodexErr;
-use codex_core::models_manager::manager::ModelsManager;
 use codex_core::token_data::IdTokenInfo;
 use codex_core::token_data::TokenData;
-use codex_otel::OtelManager;
+use codex_otel::SessionTelemetry;
+use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::ServiceTier;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use core_test_support::load_default_config_for_test;
-use core_test_support::load_sse_fixture_with_id;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::sse;
 use futures::StreamExt;
 use http::StatusCode;
 use httpdate::fmt_http_date;
@@ -39,7 +43,32 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 fn sse_completed(id: &str) -> String {
-    load_sse_fixture_with_id("../fixtures/completed_template.json", id)
+    sse(vec![ev_response_created(id), ev_completed(id)])
+}
+
+struct ClientSessionHarness {
+    client_session: codex_core::ModelClientSession,
+    model_info: codex_protocol::openai_models::ModelInfo,
+    session_telemetry: SessionTelemetry,
+    effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+    summary: ReasoningSummary,
+    service_tier: Option<ServiceTier>,
+}
+
+impl ClientSessionHarness {
+    async fn stream(&mut self, prompt: &Prompt) -> Result<codex_core::ResponseStream, CodexErr> {
+        self.client_session
+            .stream(
+                prompt,
+                &self.model_info,
+                &self.session_telemetry,
+                self.effort,
+                self.summary,
+                self.service_tier,
+                None,
+            )
+            .await
+    }
 }
 
 fn token_data(access: &str, refresh: &str) -> TokenData {
@@ -89,7 +118,7 @@ async fn build_client_session(
     codex_home: &TempDir,
     provider: ModelProviderInfo,
     auth_manager: Arc<AuthManager>,
-) -> codex_core::ModelClientSession {
+) -> ClientSessionHarness {
     build_client_session_with_config(codex_home, provider, auth_manager, |_| {}).await
 }
 
@@ -98,7 +127,7 @@ async fn build_client_session_with_config<F>(
     provider: ModelProviderInfo,
     auth_manager: Arc<AuthManager>,
     configure: F,
-) -> codex_core::ModelClientSession
+) -> ClientSessionHarness
 where
     F: FnOnce(&mut Config),
 {
@@ -107,36 +136,49 @@ where
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
     let effort = config.model_reasoning_effort;
-    let summary = config.model_reasoning_summary;
-    let model = ModelsManager::get_model_offline(config.model.as_deref());
+    let service_tier = config.service_tier;
+    let model = codex_core::test_support::get_model_offline(config.model.as_deref());
     config.model = Some(model.clone());
     let config = Arc::new(config);
-    let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
+    let model_info =
+        codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
     let conversation_id = ThreadId::new();
-    let otel_manager = OtelManager::new(
+    let summary = config
+        .model_reasoning_summary
+        .unwrap_or(model_info.default_reasoning_summary);
+    let session_telemetry = SessionTelemetry::new(
         conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
         None,
         Some("test@test.com".to_string()),
-        auth_manager.get_auth_mode(),
+        auth_manager.auth_mode().map(TelemetryAuthMode::from),
+        "test_originator".to_string(),
         false,
         "test".to_string(),
         SessionSource::Exec,
     );
 
-    ModelClient::new(
-        Arc::clone(&config),
-        Some(auth_manager),
+    ClientSessionHarness {
+        client_session: ModelClient::new(
+            Some(auth_manager),
+            config.oauth_rotation.clone(),
+            conversation_id,
+            provider,
+            SessionSource::Exec,
+            config.model_verbosity,
+            false,
+            false,
+            false,
+            None,
+        )
+        .new_session(),
         model_info,
-        otel_manager,
-        provider,
+        session_telemetry,
         effort,
         summary,
-        conversation_id,
-        SessionSource::Exec,
-    )
-    .new_session()
+        service_tier,
+    }
 }
 
 fn sample_prompt() -> Prompt {
@@ -147,6 +189,8 @@ fn sample_prompt() -> Prompt {
         content: vec![ContentItem::InputText {
             text: "hello".into(),
         }],
+        end_turn: None,
+        phase: None,
     }];
     prompt
 }

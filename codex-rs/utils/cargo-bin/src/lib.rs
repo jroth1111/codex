@@ -48,13 +48,18 @@ pub fn cargo_bin(name: &str) -> Result<PathBuf, CargoBinError> {
 
     let fallback_err = match assert_cmd::Command::cargo_bin(name) {
         Ok(cmd) => {
-            let abs = absolutize_from_buck_or_cwd(PathBuf::from(cmd.get_program()))?;
-            if abs.exists() {
-                return Ok(abs);
+            let mut path = PathBuf::from(cmd.get_program());
+            if !path.is_absolute() {
+                path = std::env::current_dir()
+                    .map_err(|source| CargoBinError::CurrentDir { source })?
+                    .join(path);
+            }
+            if path.exists() {
+                return Ok(path);
             }
             CargoBinError::ResolvedPathDoesNotExist {
                 key: "assert_cmd::Command::cargo_bin".to_owned(),
-                path: abs,
+                path,
             }
         }
         Err(err) => CargoBinError::NotFound {

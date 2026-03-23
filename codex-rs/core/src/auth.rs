@@ -1,5 +1,6 @@
 mod storage;
 
+use async_trait::async_trait;
 use chrono::DateTime;
 use chrono::Utc;
 use reqwest::StatusCode;
@@ -13,6 +14,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -59,9 +61,32 @@ pub enum AuthMode {
     Chatgpt,
 }
 
-    pub(crate) api_key: Option<String>,
-    pub(crate) oauth_record_id: Option<String>,
-    pub(crate) auth_dot_json: Arc<Mutex<Option<AuthDotJson>>>,
+impl From<AuthMode> for TelemetryAuthMode {
+    fn from(mode: AuthMode) -> Self {
+        match mode {
+            AuthMode::ApiKey => TelemetryAuthMode::ApiKey,
+            AuthMode::Chatgpt => TelemetryAuthMode::Chatgpt,
+        }
+    }
+}
+
+/// Authentication mechanism used by the current user.
+#[derive(Debug, Clone)]
+pub enum CodexAuth {
+    ApiKey(ApiKeyAuth),
+    Chatgpt(ChatgptAuth),
+    ChatgptAuthTokens(ChatgptAuthTokens),
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiKeyAuth {
+    api_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatgptAuth {
+    state: ChatgptAuthState,
+    oauth_record_id: Option<String>,
     storage: Arc<dyn AuthStorageBackend>,
 }
 
@@ -78,9 +103,17 @@ struct ChatgptAuthState {
 
 impl PartialEq for CodexAuth {
     fn eq(&self, other: &Self) -> bool {
-        self.mode == other.mode
-            && self.api_key == other.api_key
-            && self.oauth_record_id == other.oauth_record_id
+        match (self, other) {
+            (Self::ApiKey(a), Self::ApiKey(b)) => a.api_key == b.api_key,
+            (Self::Chatgpt(a), Self::Chatgpt(b)) => {
+                a.oauth_record_id == b.oauth_record_id
+                    && a.current_auth_json() == b.current_auth_json()
+            }
+            (Self::ChatgptAuthTokens(a), Self::ChatgptAuthTokens(b)) => {
+                a.current_auth_json() == b.current_auth_json()
+            }
+            _ => false,
+        }
     }
 }
 
@@ -365,7 +398,11 @@ impl CodexAuth {
         match auth_mode {
             ApiAuthMode::Chatgpt => {
                 let storage = create_auth_storage(codex_home.to_path_buf(), storage_mode);
-                Ok(Self::Chatgpt(ChatgptAuth { state, storage }))
+                Ok(Self::Chatgpt(ChatgptAuth {
+                    state,
+                    oauth_record_id: None,
+                    storage,
+                }))
             }
             ApiAuthMode::ChatgptAuthTokens => {
                 Ok(Self::ChatgptAuthTokens(ChatgptAuthTokens { state }))
@@ -413,6 +450,13 @@ impl CodexAuth {
         }
     }
 
+    pub fn oauth_record_id(&self) -> Option<&str> {
+        match self {
+            Self::Chatgpt(auth) => auth.oauth_record_id.as_deref(),
+            Self::ApiKey(_) | Self::ChatgptAuthTokens(_) => None,
+        }
+    }
+
     /// Returns `Err` if `is_chatgpt_auth()` is false.
     pub fn get_token_data(&self) -> Result<TokenData, std::io::Error> {
         let auth_dot_json: Option<AuthDotJson> = self.get_current_auth_json();
@@ -451,6 +495,8 @@ impl CodexAuth {
     /// Returns a high-level `AccountPlanType` (e.g., Free/Plus/Pro/Team/…)
     /// mapped from the ID token's internal plan value. Prefer this when you
     /// need to make UI or product decisions based on the user's subscription.
+    /// When ChatGPT auth is active but the token omits the plan claim, report
+    /// `Unknown` instead of treating the account as invalid.
     pub fn account_plan_type(&self) -> Option<AccountPlanType> {
         let map_known = |kp: &InternalKnownPlan| match kp {
             InternalKnownPlan::Free => AccountPlanType::Free,
@@ -463,12 +509,15 @@ impl CodexAuth {
             InternalKnownPlan::Edu => AccountPlanType::Edu,
         };
 
-        self.get_current_token_data()
-            .and_then(|t| t.id_token.chatgpt_plan_type)
-            .map(|pt| match pt {
-                InternalPlanType::Known(k) => map_known(&k),
-                InternalPlanType::Unknown(_) => AccountPlanType::Unknown,
-            })
+        self.get_current_token_data().map(|t| {
+            t.id_token
+                .chatgpt_plan_type
+                .map(|pt| match pt {
+                    InternalPlanType::Known(k) => map_known(&k),
+                    InternalPlanType::Unknown(_) => AccountPlanType::Unknown,
+                })
+                .unwrap_or(AccountPlanType::Unknown)
+        })
     }
 
     /// Returns `None` if `is_chatgpt_auth()` is false.
@@ -501,26 +550,22 @@ impl CodexAuth {
             last_refresh: Some(Utc::now()),
         };
 
-        let auth_dot_json = Arc::new(Mutex::new(Some(auth_dot_json)));
-        Self {
-            api_key: None,
-            mode: AuthMode::ChatGPT,
+        let state = ChatgptAuthState {
+            auth_dot_json: Arc::new(Mutex::new(Some(auth_dot_json))),
+            client: crate::default_client::create_client(),
+        };
+        Self::Chatgpt(ChatgptAuth {
+            state,
             oauth_record_id: Some("test-record".to_string()),
             storage: create_auth_storage(PathBuf::new(), AuthCredentialsStoreMode::File),
-            auth_dot_json,
-            client: crate::default_client::create_client(),
-        }
+        })
     }
 
     fn from_api_key_with_client(api_key: &str, client: CodexHttpClient) -> Self {
-        Self {
-            api_key: Some(api_key.to_owned()),
-            mode: AuthMode::ApiKey,
-            oauth_record_id: None,
-            storage: create_auth_storage(PathBuf::new(), AuthCredentialsStoreMode::File),
-            auth_dot_json: Arc::new(Mutex::new(None)),
-            client,
-        }
+        let _ = client;
+        Self::ApiKey(ApiKeyAuth {
+            api_key: api_key.to_owned(),
+        })
     }
 
     pub fn from_api_key(api_key: &str) -> Self {
@@ -538,12 +583,15 @@ impl ChatgptAuth {
         self.current_auth_json().and_then(|auth| auth.tokens)
     }
 
-    fn storage(&self) -> &Arc<dyn AuthStorageBackend> {
-        &self.storage
-    }
-
     fn client(&self) -> &CodexHttpClient {
         &self.state.client
+    }
+}
+
+impl ChatgptAuthTokens {
+    fn current_auth_json(&self) -> Option<AuthDotJson> {
+        #[expect(clippy::unwrap_used)]
+        self.state.auth_dot_json.lock().unwrap().clone()
     }
 }
 
@@ -639,6 +687,11 @@ pub fn load_auth_dot_json(
     };
 
     Ok(Some(AuthDotJson {
+        auth_mode: store
+            .openai_api_key
+            .as_ref()
+            .map(|_| ApiAuthMode::ApiKey)
+            .or(tokens.as_ref().map(|_| ApiAuthMode::Chatgpt)),
         openai_api_key: store.openai_api_key,
         tokens,
         last_refresh,
@@ -1052,18 +1105,20 @@ fn chatgpt_auth_from_record(
     storage: Arc<dyn AuthStorageBackend>,
     record: &OAuthRecord,
 ) -> CodexAuth {
-    CodexAuth {
-        api_key: None,
-        mode: AuthMode::ChatGPT,
-        oauth_record_id: Some(record.id.clone()),
-        storage,
+    let state = ChatgptAuthState {
         auth_dot_json: Arc::new(Mutex::new(Some(AuthDotJson {
+            auth_mode: Some(ApiAuthMode::Chatgpt),
             openai_api_key: None,
             tokens: Some(record.tokens.clone()),
             last_refresh: record.last_refresh,
         }))),
         client: crate::default_client::create_client(),
-    }
+    };
+    CodexAuth::Chatgpt(ChatgptAuth {
+        state,
+        oauth_record_id: Some(record.id.clone()),
+        storage,
+    })
 }
 
 fn load_auth(
@@ -1091,12 +1146,22 @@ fn load_auth(
         codex_home.to_path_buf(),
         AuthCredentialsStoreMode::Ephemeral,
     );
-    if let Some(auth_dot_json) = ephemeral_storage.load()? {
+    if let Some(store) = ephemeral_storage.load()? {
+        let Some(mut auth_dot_json) =
+            auth_dot_json_from_store(&store, DEFAULT_OAUTH_PROVIDER_ID, DEFAULT_OAUTH_NAMESPACE)
+        else {
+            return Ok(None);
+        };
+        auth_dot_json.auth_mode = Some(ApiAuthMode::ChatgptAuthTokens);
         let auth = build_auth(auth_dot_json, AuthCredentialsStoreMode::Ephemeral)?;
         return Ok(Some(auth));
     }
 
-    let client = crate::default_client::create_client();
+    if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+        return Ok(None);
+    }
+
+    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
     let store = match storage.load()? {
         Some(store) => store,
         None => return Ok(None),
@@ -1104,6 +1169,7 @@ fn load_auth(
 
     // Prefer AuthMode.ApiKey if it's set in the auth store.
     if let Some(api_key) = &store.openai_api_key {
+        let client = crate::default_client::create_client();
         return Ok(Some(CodexAuth::from_api_key_with_client(api_key, client)));
     }
 
@@ -1168,7 +1234,7 @@ async fn update_tokens(
 
             if let Some(id_token) = id_token {
                 record.tokens.id_token =
-                    parse_id_token(&id_token).map_err(std::io::Error::other)?;
+                    parse_chatgpt_jwt_claims(&id_token).map_err(std::io::Error::other)?;
             }
             if let Some(access_token) = access_token {
                 record.tokens.access_token = access_token;
@@ -1183,6 +1249,7 @@ async fn update_tokens(
 
         Ok((
             AuthDotJson {
+                auth_mode: Some(ApiAuthMode::Chatgpt),
                 openai_api_key,
                 tokens: Some(tokens),
                 last_refresh,
@@ -1202,7 +1269,6 @@ async fn request_chatgpt_token_refresh(
         client_id: CLIENT_ID,
         grant_type: "refresh_token",
         refresh_token,
-        scope: "openid profile email",
     };
 
     let endpoint = refresh_token_endpoint();
@@ -1298,7 +1364,6 @@ struct RefreshRequest {
     client_id: &'static str,
     grant_type: &'static str,
     refresh_token: String,
-    scope: &'static str,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1888,37 +1953,38 @@ impl AuthManager {
         let refresh_token = record.tokens.refresh_token.clone();
         let access_token = record.tokens.access_token.clone();
         let client = crate::default_client::create_client();
-        let refresh_response = match try_refresh_token(refresh_token.clone(), &client).await {
-            Ok(response) => response,
-            Err(err) => {
-                let refreshed_elsewhere = match storage.load().ok().flatten() {
-                    Some(store) => match store.providers.get(DEFAULT_OAUTH_PROVIDER_ID) {
-                        Some(AuthProviderEntry::Oauth(provider)) => {
-                            find_record(provider, record_id).is_some_and(|latest| {
-                                latest.tokens.refresh_token != refresh_token
-                                    || latest.tokens.access_token != access_token
-                            })
+        let refresh_response =
+            match request_chatgpt_token_refresh(refresh_token.clone(), &client).await {
+                Ok(response) => response,
+                Err(err) => {
+                    let refreshed_elsewhere = match storage.load().ok().flatten() {
+                        Some(store) => match store.providers.get(DEFAULT_OAUTH_PROVIDER_ID) {
+                            Some(AuthProviderEntry::Oauth(provider)) => {
+                                find_record(provider, record_id).is_some_and(|latest| {
+                                    latest.tokens.refresh_token != refresh_token
+                                        || latest.tokens.access_token != access_token
+                                })
+                            }
+                            _ => false,
+                        },
+                        None => false,
+                    };
+
+                    if refreshed_elsewhere {
+                        if self
+                            .auth_cached()
+                            .as_ref()
+                            .and_then(CodexAuth::oauth_record_id)
+                            == Some(record_id)
+                        {
+                            self.reload();
                         }
-                        _ => false,
-                    },
-                    None => false,
-                };
-
-                if refreshed_elsewhere {
-                    if self
-                        .auth_cached()
-                        .as_ref()
-                        .and_then(|auth| auth.oauth_record_id.as_deref())
-                        == Some(record_id)
-                    {
-                        self.reload();
+                        return Ok(());
                     }
-                    return Ok(());
-                }
 
-                return Err(err);
-            }
-        };
+                    return Err(err);
+                }
+            };
         update_tokens(
             &self.codex_home,
             &storage,
@@ -1933,7 +1999,7 @@ impl AuthManager {
         if self
             .auth_cached()
             .as_ref()
-            .and_then(|auth| auth.oauth_record_id.as_deref())
+            .and_then(CodexAuth::oauth_record_id)
             == Some(record_id)
         {
             self.reload();
@@ -2246,6 +2312,7 @@ impl AuthManager {
             refresh_response.access_token,
             refresh_response.refresh_token,
         )
+        .await
         .map_err(RefreshTokenError::from)?;
         self.reload();
 
@@ -2278,7 +2345,7 @@ mod tests {
         let fake_jwt = write_auth_file(
             AuthFileParams {
                 openai_api_key: None,
-                chatgpt_plan_type: "pro".to_string(),
+                chatgpt_plan_type: Some("pro".to_string()),
                 chatgpt_account_id: None,
             },
             codex_home.path(),
@@ -2297,6 +2364,7 @@ mod tests {
             Some("new-access-token".to_string()),
             Some("new-refresh-token".to_string()),
         )
+        .await
         .expect("update_tokens should succeed");
 
         let tokens = updated.tokens.expect("tokens should exist");
@@ -2350,7 +2418,7 @@ mod tests {
         let fake_jwt = write_auth_file(
             AuthFileParams {
                 openai_api_key: None,
-                chatgpt_plan_type: "pro".to_string(),
+                chatgpt_plan_type: Some("pro".to_string()),
                 chatgpt_account_id: None,
             },
             codex_home.path(),
@@ -2372,7 +2440,7 @@ mod tests {
 
         assert_eq!(
             AuthDotJson {
-                auth_mode: None,
+                auth_mode: Some(ApiAuthMode::Chatgpt),
                 openai_api_key: None,
                 tokens: Some(TokenData {
                     id_token: IdTokenInfo {
@@ -2431,7 +2499,7 @@ mod tests {
 
     struct AuthFileParams {
         openai_api_key: Option<String>,
-        chatgpt_plan_type: String,
+        chatgpt_plan_type: Option<String>,
         chatgpt_account_id: Option<String>,
     }
 
@@ -2448,10 +2516,13 @@ mod tests {
             typ: "JWT",
         };
         let mut auth_payload = serde_json::json!({
-            "chatgpt_plan_type": params.chatgpt_plan_type,
             "chatgpt_user_id": "user-12345",
             "user_id": "user-12345",
         });
+
+        if let Some(chatgpt_plan_type) = params.chatgpt_plan_type {
+            auth_payload["chatgpt_plan_type"] = serde_json::Value::String(chatgpt_plan_type);
+        }
 
         if let Some(chatgpt_account_id) = params.chatgpt_account_id {
             let org_value = serde_json::Value::String(chatgpt_account_id);
@@ -2553,7 +2624,7 @@ mod tests {
         let _jwt = write_auth_file(
             AuthFileParams {
                 openai_api_key: None,
-                chatgpt_plan_type: "pro".to_string(),
+                chatgpt_plan_type: Some("pro".to_string()),
                 chatgpt_account_id: Some("org_another_org".to_string()),
             },
             codex_home.path(),
@@ -2578,7 +2649,7 @@ mod tests {
         let _jwt = write_auth_file(
             AuthFileParams {
                 openai_api_key: None,
-                chatgpt_plan_type: "pro".to_string(),
+                chatgpt_plan_type: Some("pro".to_string()),
                 chatgpt_account_id: Some("org_mine".to_string()),
             },
             codex_home.path(),
@@ -2632,7 +2703,7 @@ mod tests {
         let _jwt = write_auth_file(
             AuthFileParams {
                 openai_api_key: None,
-                chatgpt_plan_type: "pro".to_string(),
+                chatgpt_plan_type: Some("pro".to_string()),
                 chatgpt_account_id: None,
             },
             codex_home.path(),
@@ -2652,7 +2723,27 @@ mod tests {
         let _jwt = write_auth_file(
             AuthFileParams {
                 openai_api_key: None,
-                chatgpt_plan_type: "mystery-tier".to_string(),
+                chatgpt_plan_type: Some("mystery-tier".to_string()),
+                chatgpt_account_id: None,
+            },
+            codex_home.path(),
+        )
+        .expect("failed to write auth file");
+
+        let auth = super::load_auth(codex_home.path(), false, AuthCredentialsStoreMode::File)
+            .expect("load auth")
+            .expect("auth available");
+
+        pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
+    }
+
+    #[test]
+    fn missing_plan_type_maps_to_unknown() {
+        let codex_home = tempdir().unwrap();
+        let _jwt = write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: None,
                 chatgpt_account_id: None,
             },
             codex_home.path(),

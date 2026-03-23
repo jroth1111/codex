@@ -20,9 +20,11 @@ use std::sync::Mutex;
 use tracing::warn;
 
 use crate::token_data::TokenData;
-use crate::token_data::parse_id_token;
+use crate::token_data::parse_chatgpt_jwt_claims;
+use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
+use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 /// Determine where Codex should store CLI auth credentials.
@@ -44,7 +46,7 @@ pub enum AuthCredentialsStoreMode {
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct AuthDotJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_mode: Option<AuthMode>,
+    pub auth_mode: Option<ApiAuthMode>,
 
     #[serde(rename = "OPENAI_API_KEY")]
     pub openai_api_key: Option<String>,
@@ -249,7 +251,7 @@ fn auth_store_from_legacy_raw(auth: AuthDotJsonRaw) -> AuthStore {
         return store;
     };
 
-    let id_token = match parse_id_token(&tokens.id_token) {
+    let id_token = match parse_chatgpt_jwt_claims(&tokens.id_token) {
         Ok(id_token) => id_token,
         Err(err) => {
             warn!("failed to parse stored id_token; dropping legacy tokens: {err}");
@@ -316,6 +318,7 @@ pub(crate) fn auth_dot_json_from_store(
         .find(|record| record.id == record_id && record.namespace == namespace)?;
 
     Some(AuthDotJson {
+        auth_mode: Some(ApiAuthMode::Chatgpt),
         openai_api_key: store.openai_api_key.clone(),
         tokens: Some(record.tokens.clone()),
         last_refresh: record.last_refresh,
@@ -529,8 +532,8 @@ impl AuthStorageBackend for AutoAuthStorage {
     }
 }
 
-// A global in-memory store for mapping codex_home -> AuthDotJson.
-static EPHEMERAL_AUTH_STORE: Lazy<Mutex<HashMap<String, AuthDotJson>>> =
+// A global in-memory store for mapping codex_home -> AuthStore.
+static EPHEMERAL_AUTH_STORE: Lazy<Mutex<HashMap<String, AuthStore>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug)]
@@ -545,7 +548,7 @@ impl EphemeralAuthStorage {
 
     fn with_store<F, T>(&self, action: F) -> std::io::Result<T>
     where
-        F: FnOnce(&mut HashMap<String, AuthDotJson>, String) -> std::io::Result<T>,
+        F: FnOnce(&mut HashMap<String, AuthStore>, String) -> std::io::Result<T>,
     {
         let key = compute_store_key(&self.codex_home)?;
         let mut store = EPHEMERAL_AUTH_STORE
@@ -556,11 +559,11 @@ impl EphemeralAuthStorage {
 }
 
 impl AuthStorageBackend for EphemeralAuthStorage {
-    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+    fn load(&self) -> std::io::Result<Option<AuthStore>> {
         self.with_store(|store, key| Ok(store.get(&key).cloned()))
     }
 
-    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+    fn save(&self, auth: &AuthStore) -> std::io::Result<()> {
         self.with_store(|store, key| {
             store.insert(key, auth.clone());
             Ok(())
@@ -613,7 +616,7 @@ mod tests {
         let codex_home = tempdir()?;
         let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
         let auth_dot_json = AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
+            auth_mode: Some(ApiAuthMode::ApiKey),
             openai_api_key: Some("test-key".to_string()),
             tokens: None,
             last_refresh: Some(Utc::now()),
@@ -634,7 +637,7 @@ mod tests {
         let codex_home = tempdir()?;
         let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
         let auth_dot_json = AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
+            auth_mode: Some(ApiAuthMode::ApiKey),
             openai_api_key: Some("test-key".to_string()),
             tokens: None,
             last_refresh: Some(Utc::now()),
@@ -657,7 +660,7 @@ mod tests {
     fn file_storage_delete_removes_auth_file() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let auth_dot_json = AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
+            auth_mode: Some(ApiAuthMode::ApiKey),
             openai_api_key: Some("sk-test-key".to_string()),
             tokens: None,
             last_refresh: None,
@@ -681,15 +684,16 @@ mod tests {
             AuthCredentialsStoreMode::Ephemeral,
         );
         let auth_dot_json = AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
+            auth_mode: Some(ApiAuthMode::ApiKey),
             openai_api_key: Some("sk-ephemeral".to_string()),
             tokens: None,
             last_refresh: Some(Utc::now()),
         };
+        let auth_store = auth_store_from_legacy(auth_dot_json);
 
-        storage.save(&auth_dot_json)?;
+        storage.save(&auth_store)?;
         let loaded = storage.load()?;
-        assert_eq!(Some(auth_dot_json), loaded);
+        assert_eq!(Some(auth_store), loaded);
 
         let removed = storage.delete()?;
         assert!(removed);
@@ -774,7 +778,7 @@ mod tests {
 
     fn auth_with_prefix(prefix: &str) -> AuthDotJson {
         AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
+            auth_mode: Some(ApiAuthMode::ApiKey),
             openai_api_key: Some(format!("{prefix}-api-key")),
             tokens: Some(TokenData {
                 id_token: id_token_with_prefix(prefix),
@@ -799,6 +803,7 @@ mod tests {
             Arc::new(mock_keyring.clone()),
         );
         let expected = auth_store_from_legacy(AuthDotJson {
+            auth_mode: Some(ApiAuthMode::ApiKey),
             openai_api_key: Some("sk-test".to_string()),
             tokens: None,
             last_refresh: None,
@@ -835,6 +840,7 @@ mod tests {
         let auth_file = get_auth_file(codex_home.path());
         std::fs::write(&auth_file, "stale")?;
         let auth = auth_store_from_legacy(AuthDotJson {
+            auth_mode: Some(ApiAuthMode::Chatgpt),
             openai_api_key: None,
             tokens: Some(TokenData {
                 id_token: Default::default(),

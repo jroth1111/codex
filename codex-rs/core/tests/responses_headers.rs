@@ -6,9 +6,8 @@ use codex_core::ModelClient;
 use codex_core::ModelProviderInfo;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
-use codex_core::ResponsesWebsocketVersion;
 use codex_core::WireApi;
-use codex_otel::OtelManager;
+use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
@@ -73,7 +72,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
     let session_source = SessionSource::SubAgent(SubAgentSource::Review);
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
-    let otel_manager = OtelManager::new(
+    let session_telemetry = SessionTelemetry::new(
         conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
@@ -88,11 +87,12 @@ async fn responses_stream_includes_subagent_header_on_review() {
 
     let client = ModelClient::new(
         None,
+        config.oauth_rotation.clone(),
         conversation_id,
         provider.clone(),
         session_source,
         config.model_verbosity,
-        None::<ResponsesWebsocketVersion>,
+        false,
         false,
         false,
         None,
@@ -114,9 +114,10 @@ async fn responses_stream_includes_subagent_header_on_review() {
         .stream(
             &prompt,
             &model_info,
-            &otel_manager,
+            &session_telemetry,
             effort,
             summary.unwrap_or(model_info.default_reasoning_summary),
+            None,
             None,
         )
         .await
@@ -185,7 +186,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
 
-    let otel_manager = OtelManager::new(
+    let session_telemetry = SessionTelemetry::new(
         conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
@@ -200,11 +201,12 @@ async fn responses_stream_includes_subagent_header_on_other() {
 
     let client = ModelClient::new(
         None,
+        config.oauth_rotation.clone(),
         conversation_id,
         provider.clone(),
         session_source,
         config.model_verbosity,
-        None::<ResponsesWebsocketVersion>,
+        false,
         false,
         false,
         None,
@@ -226,9 +228,10 @@ async fn responses_stream_includes_subagent_header_on_other() {
         .stream(
             &prompt,
             &model_info,
-            &otel_manager,
+            &session_telemetry,
             effort,
             summary.unwrap_or(model_info.default_reasoning_summary),
+            None,
             None,
         )
         .await
@@ -296,7 +299,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         SessionSource::SubAgent(SubAgentSource::Other("override-check".to_string()));
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
-    let otel_manager = OtelManager::new(
+    let session_telemetry = SessionTelemetry::new(
         conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
@@ -311,11 +314,12 @@ async fn responses_respects_model_info_overrides_from_config() {
 
     let client = ModelClient::new(
         None,
+        config.oauth_rotation.clone(),
         conversation_id,
         provider.clone(),
         session_source,
         config.model_verbosity,
-        None::<ResponsesWebsocketVersion>,
+        false,
         false,
         false,
         None,
@@ -337,9 +341,10 @@ async fn responses_respects_model_info_overrides_from_config() {
         .stream(
             &prompt,
             &model_info,
-            &otel_manager,
+            &session_telemetry,
             effort,
             summary.unwrap_or(model_info.default_reasoning_summary),
+            None,
             None,
         )
         .await

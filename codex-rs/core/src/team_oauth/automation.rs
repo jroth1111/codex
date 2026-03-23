@@ -539,6 +539,51 @@ impl TeamOAuthAutomation {
         }
         Ok(removed)
     }
+
+    /// Detect team ID from owner tokens.
+    ///
+    /// This extracts the team ID from the id_token claims.
+    /// The team ID is stored in `chatgpt_account_id` for workspace accounts.
+    pub fn detect_team_id_from_tokens(tokens: &TokenData) -> Option<String> {
+        tokens.id_token.chatgpt_account_id.clone()
+    }
+
+    /// Detect team ID from owner tokens using API call.
+    ///
+    /// This calls the ChatGPT backend API to get the workspace info.
+    pub async fn detect_team_id_from_api(&self, access_token: &str) -> Result<Option<String>, AutomationError> {
+        #[derive(Deserialize)]
+        struct WorkspaceInfo {
+            workspace_id: Option<String>,
+            account_id: Option<String>,
+        }
+
+        let url = "https://chatgpt.com/backend-api/accounts/workspace_policy";
+
+        let response = self
+            .http_client
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(AutomationError::OAuthFailed {
+                email: "api".to_string(),
+                reason: format!("Failed to get workspace info: {}", body),
+            });
+        }
+
+        let info: WorkspaceInfo = response.json().await.map_err(|e| {
+            AutomationError::OAuthFailed {
+                email: "api".to_string(),
+                reason: format!("Failed to parse workspace response: {}", e),
+            }
+        })?;
+
+        Ok(info.workspace_id.or(info.account_id))
+    }
 }
 
 #[cfg(test)]

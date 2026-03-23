@@ -51,6 +51,17 @@ impl IdTokenInfo {
             ))
         )
     }
+
+    /// Get the ChatGPT account/workspace ID from the token.
+    /// This is the team ID for workspace accounts.
+    pub fn get_chatgpt_account_id(&self) -> Option<&str> {
+        self.chatgpt_account_id.as_deref()
+    }
+
+    /// Get the ChatGPT user ID from the token.
+    pub fn get_chatgpt_user_id(&self) -> Option<&str> {
+        self.chatgpt_user_id.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

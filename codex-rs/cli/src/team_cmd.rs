@@ -40,7 +40,7 @@ enum TeamSubcommand {
     /// List all teams.
     List,
 
-    /// Show details for a team.
+    /// Show details for a team (omit ID to auto-detect from tokens).
     Show(ShowTeamArgs),
 
     /// Remove a team.
@@ -54,6 +54,9 @@ enum TeamSubcommand {
 
     /// Full setup: create team, invite members, and auto-login.
     Setup(SetupTeamArgs),
+
+    /// Detect team ID from owner tokens.
+    DetectId(DetectIdArgs),
 
     /// Test OTP client connection.
     TestOtp,
@@ -84,9 +87,9 @@ struct CreateTeamArgs {
 
 #[derive(Debug, Args)]
 struct ShowTeamArgs {
-    /// Team ID
+    /// Team ID (omit to auto-detect from stored tokens)
     #[arg(value_name = "TEAM_ID")]
-    team_id: String,
+    team_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -98,9 +101,9 @@ struct RemoveTeamArgs {
 
 #[derive(Debug, Args)]
 struct InviteMemberArgs {
-    /// Team ID
+    /// Team ID (omit to auto-detect from stored tokens)
     #[arg(value_name = "TEAM_ID")]
-    team_id: String,
+    team_id: Option<String>,
 
     /// Member email address
     #[arg(value_name = "EMAIL")]
@@ -113,9 +116,9 @@ struct InviteMemberArgs {
 
 #[derive(Debug, Args)]
 struct LoginMembersArgs {
-    /// Team ID
+    /// Team ID (omit to auto-detect from stored tokens)
     #[arg(value_name = "TEAM_ID")]
-    team_id: String,
+    team_id: Option<String>,
 
     /// Specific member email to login (if omitted, logs in all pending members)
     #[arg(value_name = "EMAIL")]
@@ -147,6 +150,25 @@ struct SetupTeamArgs {
     /// Member email addresses to invite and auto-login
     #[arg(value_name = "EMAILS")]
     member_emails: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct DetectIdArgs {
+    /// Access token to detect team ID from
+    #[arg(long = "access-token", value_name = "TOKEN")]
+    access_token: Option<String>,
+
+    /// ID token (JWT) to extract team ID from
+    #[arg(long = "id-token", value_name = "TOKEN")]
+    id_token: Option<String>,
+
+    /// Read tokens from stdin as JSON
+    #[arg(long = "stdin")]
+    stdin: bool,
+
+    /// Use API to detect (requires access token)
+    #[arg(long = "api")]
+    use_api: bool,
 }
 
 impl TeamCommand {
@@ -183,6 +205,7 @@ impl TeamCommand {
             TeamSubcommand::Invite(args) => run_invite_member(&automation, args).await,
             TeamSubcommand::Login(args) => run_login_members(&automation, args).await,
             TeamSubcommand::Setup(args) => run_setup_team(&automation, args).await,
+            TeamSubcommand::DetectId(args) => run_detect_id(&automation, args).await,
             TeamSubcommand::TestOtp => run_test_otp(&self).await,
         }
     }
@@ -218,8 +241,27 @@ async fn run_list_teams(automation: &TeamOAuthAutomation) -> anyhow::Result<()> 
 }
 
 async fn run_show_team(automation: &TeamOAuthAutomation, args: ShowTeamArgs) -> anyhow::Result<()> {
-    let team = automation.get_team(&args.team_id).await
-        .ok_or_else(|| anyhow::anyhow!("Team not found: {}", args.team_id))?;
+    let team_id = match args.team_id {
+        Some(id) => id,
+        None => {
+            // Auto-detect from stored teams
+            let teams = automation.list_teams().await;
+            match teams.len() {
+                0 => anyhow::bail!("No teams found. Create one first with 'codex team create'."),
+                1 => teams[0].id.clone(),
+                n => {
+                    eprintln!("Found {} teams. Please specify --team-id:", n);
+                    for team in teams {
+                        eprintln!("  {} - {}", team.id, team.name);
+                    }
+                    anyhow::bail!("Ambiguous team selection");
+                }
+            }
+        }
+    };
+
+    let team = automation.get_team(&team_id).await
+        .ok_or_else(|| anyhow::anyhow!("Team not found: {}", team_id))?;
 
     eprintln!("Team: {} ({})", team.name, team.id);
     eprintln!("Created: {}", team.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
@@ -256,6 +298,8 @@ async fn run_remove_team(automation: &TeamOAuthAutomation, args: RemoveTeamArgs)
 }
 
 async fn run_invite_member(automation: &TeamOAuthAutomation, args: InviteMemberArgs) -> anyhow::Result<()> {
+    let team_id = resolve_team_id(automation, args.team_id).await?;
+
     let role = match args.role.to_lowercase().as_str() {
         "owner" => TeamRole::Owner,
         "admin" => TeamRole::Admin,
@@ -263,17 +307,19 @@ async fn run_invite_member(automation: &TeamOAuthAutomation, args: InviteMemberA
         _ => anyhow::bail!("Invalid role: {}. Use 'owner', 'admin', or 'member'.", args.role),
     };
 
-    let member = automation.invite_member(&args.team_id, args.email.clone(), role).await?;
+    let member = automation.invite_member(&team_id, args.email.clone(), role).await?;
 
-    eprintln!("Invited {} to team {} (member_id: {})", args.email, args.team_id, member.id);
+    eprintln!("Invited {} to team {} (member_id: {})", args.email, team_id, member.id);
     Ok(())
 }
 
 async fn run_login_members(automation: &TeamOAuthAutomation, args: LoginMembersArgs) -> anyhow::Result<()> {
+    let team_id = resolve_team_id(automation, args.team_id).await?;
+
     if let Some(email) = &args.email {
         // Login specific member
         eprintln!("Logging in member: {}", email);
-        match automation.login_member_via_otp(&args.team_id, email).await {
+        match automation.login_member_via_otp(&team_id, email).await {
             Ok(tokens) => {
                 let member_email = tokens.id_token.email.as_deref().unwrap_or(email);
                 eprintln!("✓ Successfully logged in: {}", member_email);
@@ -285,7 +331,7 @@ async fn run_login_members(automation: &TeamOAuthAutomation, args: LoginMembersA
         }
     } else {
         // Login all pending members
-        let results = automation.login_pending_members(&args.team_id).await?;
+        let results = automation.login_pending_members(&team_id).await?;
 
         if results.is_empty() {
             eprintln!("No pending members to log in.");
@@ -342,6 +388,54 @@ async fn run_setup_team(automation: &TeamOAuthAutomation, args: SetupTeamArgs) -
     Ok(())
 }
 
+async fn run_detect_id(automation: &TeamOAuthAutomation, args: DetectIdArgs) -> anyhow::Result<()> {
+    // If no tokens provided, try to detect from stored teams
+    if args.access_token.is_none() && args.id_token.is_none() && !args.stdin {
+        let teams = automation.list_teams().await;
+        if teams.is_empty() {
+            eprintln!("No teams found. Provide tokens with --id-token or --stdin.");
+            return Ok(());
+        }
+        for team in teams {
+            if let Some(account_id) = &team.owner_tokens.account_id {
+                eprintln!("Team: {} - Account ID: {}", team.name, account_id);
+            }
+            if let Some(email) = &team.owner_tokens.id_token.email {
+                eprintln!("  Owner: {}", email);
+            }
+        }
+        return Ok(());
+    }
+
+    let tokens = read_tokens(&Some(String::new()), &Some(String::new()), &args.id_token, args.stdin)?;
+
+    // Extract from ID token claims
+    if let Some(account_id) = TeamOAuthAutomation::detect_team_id_from_tokens(&tokens) {
+        eprintln!("Detected from ID token: {}", account_id);
+        println!("{}", account_id);
+    } else {
+        eprintln!("No team ID found in ID token claims.");
+
+        // Try API if requested
+        if args.use_api && !tokens.access_token.is_empty() {
+            match automation.detect_team_id_from_api(&tokens.access_token).await {
+                Ok(Some(id)) => {
+                    eprintln!("Detected from API: {}", id);
+                    println!("{}", id);
+                }
+                Ok(None) => {
+                    eprintln!("No workspace found via API.");
+                }
+                Err(e) => {
+                    eprintln!("API detection failed: {}", e);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_test_otp(cmd: &TeamCommand) -> anyhow::Result<()> {
     let otp_client = match &cmd.cf_token {
         Some(token) => {
@@ -377,6 +471,27 @@ async fn run_test_otp(cmd: &TeamCommand) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve team ID, auto-detecting if not provided.
+async fn resolve_team_id(automation: &TeamOAuthAutomation, team_id: Option<String>) -> anyhow::Result<String> {
+    match team_id {
+        Some(id) => Ok(id),
+        None => {
+            let teams = automation.list_teams().await;
+            match teams.len() {
+                0 => anyhow::bail!("No teams found. Create one first with 'codex team create'."),
+                1 => Ok(teams[0].id.clone()),
+                n => {
+                    eprintln!("Found {} teams. Please specify team ID:", n);
+                    for team in teams {
+                        eprintln!("  {} - {}", team.id, team.name);
+                    }
+                    anyhow::bail!("Ambiguous team selection");
+                }
+            }
+        }
+    }
 }
 
 fn read_tokens(

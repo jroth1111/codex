@@ -1,6 +1,6 @@
 //! Shared retry and transport fallback decisions for Responses requests.
 //! Content-filter guidance is recorded for sampling requests before retry decisions.
-//! Server advice controls timing without extending configured retry limits.
+//! Server advice controls timing; model-capacity errors remain queued beyond configured retry limits.
 
 use std::time::Duration;
 
@@ -22,6 +22,8 @@ use tracing::warn;
 
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
+const INITIAL_CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
@@ -44,6 +46,7 @@ pub(crate) fn is_terminal_sampling_outcome(error: &CodexErr) -> bool {
 
 pub(crate) struct ResponsesStreamRetryState {
     retries: u64,
+    capacity_retries: u64,
     connection_retries: u64,
     connection_retry_delay: Duration,
 }
@@ -52,6 +55,7 @@ impl Default for ResponsesStreamRetryState {
     fn default() -> Self {
         Self {
             retries: 0,
+            capacity_retries: 0,
             connection_retries: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
         }
@@ -66,7 +70,8 @@ pub(crate) struct ExhaustedResponseRetry {
 }
 
 /// Returns `Ok(())` when the caller should retry the request loop, or the original error when
-/// it is terminal or the retry budget is exhausted.
+/// it is terminal or the retry budget is exhausted. Model-capacity errors wait indefinitely and
+/// do not consume the ordinary stream retry budget.
 #[tracing::instrument(level = "trace", skip_all, fields(request = ?request))]
 pub(crate) async fn handle_response_stream_error(
     retry_state: &mut ResponsesStreamRetryState,
@@ -98,11 +103,45 @@ pub(crate) async fn handle_response_stream_error(
         ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
         ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
     };
+    let retry_after = err.retry_after();
+    let waiting_for_capacity = matches!(err.details(), CodexErrorDetails::ServerOverloaded);
+
+    if waiting_for_capacity {
+        let retry_count = retry_state.capacity_retries.saturating_add(1);
+        let delay = retry_after
+            .map(RetryAfter::remaining_delay)
+            .unwrap_or_else(|| {
+                codex_client::backoff(INITIAL_CAPACITY_RETRY_DELAY, retry_count)
+                    .min(MAX_CAPACITY_RETRY_DELAY)
+            });
+        retry_state.capacity_retries = retry_count;
+        warn!(
+            turn_id = %turn_context.sub_id,
+            retry_count,
+            ?delay,
+            capacity_error = %err,
+            "model is at capacity; waiting to retry"
+        );
+        sess.notify_stream_error(
+            turn_context,
+            format!(
+                "Waiting for model capacity; will retry automatically (attempt {retry_count})"
+            ),
+            err,
+        )
+        .await;
+        let now = Instant::now();
+        let retry_at = retry_after.map(RetryAfter::deadline).unwrap_or(now + delay);
+        let delay = retry_at.saturating_duration_since(now);
+        codex_client::record_retry!(retry_count, delay, operation);
+        tokio::time::sleep_until(retry_at).await;
+        return Ok(());
+    }
+
     let retry_count = retry_state.retries.saturating_add(1);
     let Some(delay) = err.retry_delay(retry_count) else {
         return Err(err);
     };
-    let retry_after = err.retry_after();
 
     if turn_context
         .config

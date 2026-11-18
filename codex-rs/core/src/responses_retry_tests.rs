@@ -1,3 +1,4 @@
+use super::INITIAL_CAPACITY_RETRY_DELAY;
 use super::ResponsesStreamRequest;
 use super::ResponsesStreamRetryState;
 use super::handle_response_stream_error;
@@ -48,6 +49,33 @@ async fn sampling_retry_logs_stream_error_context() {
     assert!(logs.contains(
         "sampling_error=stream disconnected before completion: websocket closed by server before response.completed"
     ));
+}
+
+#[tokio::test]
+async fn server_overloaded_waits_without_consuming_stream_retry_budget() {
+    let (session, turn_context) = make_session_and_context().await;
+    let step_context = StepContext::for_test(Arc::new(turn_context));
+    let mut client_session = session.services.model_client.new_session();
+    let mut retry_state = ResponsesStreamRetryState::default();
+
+    tokio::time::pause();
+    let retry = handle_response_stream_error(
+        &mut retry_state,
+        /*max_retries*/ 0,
+        CodexErr::ServerOverloaded,
+        &mut client_session,
+        &session,
+        &step_context,
+        ResponsesStreamRequest::Sampling,
+    );
+    tokio::pin!(retry);
+    assert!(futures::poll!(&mut retry).is_pending());
+    tokio::time::advance(INITIAL_CAPACITY_RETRY_DELAY + Duration::from_secs(1)).await;
+    retry.await
+        .expect("capacity errors should remain queued past the normal retry budget");
+
+    assert_eq!(retry_state.capacity_retries, 1);
+    assert_eq!(retry_state.retries, 0);
 }
 
 /// Time spent reporting a retry must count toward the server's original deadline.
